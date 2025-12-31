@@ -20,15 +20,15 @@ cd forward-forward-rs
 
 [Download](https://github.com/jesper-olsen/mnist-rs) the MNIST dataset.
 
-Run the models:
+Run the program:
 
 ```bash
-cargo run --bin ff --release
+cargo run --bin ff --release -- --dir MNIST
 ```
 
 Sample output:
 ```text
-Training Forward-Forward Model...
+Training Forward-Forward Model on MNIST...
 Epoch   0 | Cost:  86.0361
 Epoch   1 | Cost:  39.5928
 Epoch   2 | Cost:  29.8963

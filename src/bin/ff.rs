@@ -1,3 +1,4 @@
+use clap::Parser;
 use engram::Mat;
 use mnist::{IMAGE_HEIGHT, IMAGE_WIDTH, Mnist, NPIXELS, error::MnistError};
 use rand::prelude::*;
@@ -25,6 +26,14 @@ const DELAY: f32 = 0.9;
 const LAYERS: [usize; 4] = [784, 1000, 1000, 1000];
 const BATCH_SIZE: usize = 100;
 const MAX_EPOCH: usize = 200;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long="dir", default_value_t = String::from("MNIST"))]
+    /// X-axis range: min,max
+    dir: String,
+}
 
 // --- Data Structures ---
 
@@ -567,8 +576,8 @@ fn load_model(path: &str) -> std::io::Result<Vec<Layer>> {
     Ok(model)
 }
 
-fn train_model() -> Result<(), MnistError> {
-    let data = Mnist::load("MNIST")?;
+fn train_model(dir: &str) -> Result<(), MnistError> {
+    let data = Mnist::load(dir)?;
     // UNIFIED RNG: Single SmallRng used for everything.
     let mut rng = SmallRng::seed_from_u64(1234);
 
@@ -597,14 +606,14 @@ fn train_model() -> Result<(), MnistError> {
     let mut ws = BatchWorkspace::new(&LAYERS, BATCH_SIZE);
 
     // TRAINING RANGES
-    const RTRAIN: std::ops::Range<usize> = 0..50000;
+    const RTRAIN: std::ops::Range<usize> = 0..60000;
     const RVAL: std::ops::Range<usize> = 50000..60000;
 
     // Initialize indices specifically for the training slice size (50,000)
     let mut indices: Vec<usize> = (0..RTRAIN.len()).collect();
     let mut seed_buffer: Vec<u64> = vec![0; BATCH_SIZE];
 
-    println!("Training Forward-Forward Model...");
+    println!("Training Forward-Forward Model on {dir}...");
     for epoch in 0..MAX_EPOCH {
         let cost = train_epoch(
             &mut model,
@@ -665,9 +674,11 @@ fn print_confusions(matrix: &[[usize; 10]; 10]) {
 }
 
 fn main() -> Result<(), MnistError> {
-    train_model()?;
+    let args = Args::parse();
+
+    train_model(&args.dir)?;
     if true {
-        let data = Mnist::load("MNIST")?;
+        let data = Mnist::load(&args.dir)?;
         let train_imgs: Vec<[f32; NPIXELS]> = data
             .train_images
             .iter()
