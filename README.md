@@ -76,7 +76,7 @@ This model achieves near-state-of-the-art performance (99.29%) for MNIST without
 |               | Test Accuracy | Errors Test | Epochs
 |--------------:|--------------:|------------:|-------:
 | Train on 50k  | 99.29%        | 71 / 10,000 | 200
-| Train on 60k  |   .  %        |    / 10,000 | 200
+| Train on 60k  | 99.31%        | 69 / 10,000 | 200
 
 ## References
 
