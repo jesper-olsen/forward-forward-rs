@@ -1,6 +1,11 @@
 # Forward-Forward (FF)
 
-Based on Geoffrey Hinton's Forward-Forward algorithm. Instead of backpropagation, each layer is trained to distinguish between "positive" data (real MNIST digits with correct labels) and "negative" data (digits with incorrect labels).
+Rust implementation of Geoffrey Hinton's Forward-Forward algorithm [1]. The model is evaluated on MNIST and Fashion MNIST.
+
+On MNIST it achieves an error rate of 71/10,000 = 0.71% compared to the papers 1.40% baseline - achieved mainly by adding
+dropout and data augmentation to the training mix.
+
+On Fashion-MNIST it achieves 89.5% accuracy, which is competitive with standard backpropagation for non-convolutional networks.
 
 For a comparison with Hyperdimensional/Binary computing approaches (HDC), see [Engram](https://github.com/jesper-olsen/engram).
 
@@ -57,7 +62,7 @@ Actual |  P0    P1    P2    P3    P4    P5    P6    P7    P8    P9
 ```
 
 ## Overview
-This model achieves near-state-of-the-art performance (99.29%) for MNIST without ever calculating a global gradient or using a chain rule.
+This model achieves state-of-the-art performance (99.31%) for fully connected Forward-Forward networks, halving the error rate of the original paper's baseline implementation [1].
 
 ### Key Techniques
 
@@ -71,16 +76,23 @@ This model achieves near-state-of-the-art performance (99.29%) for MNIST without
 
 * **Supervised Head**: A softmax layer sits on top of the normalised hidden states, accumulating scores from all supervised layers to provide the final classification.
 
-### Results 
+### Results - MNIST
 
 |               | Test Accuracy | Errors Test | Epochs
 |--------------:|--------------:|------------:|-------:
 | Train on 50k  | 99.29%        | 71 / 10,000 | 200
 | Train on 60k  | 99.31%        | 69 / 10,000 | 200
 
+### Results - Fashion MNIST
+
+|               | Test Accuracy |  Errors Test  | Epochs
+|--------------:|--------------:|--------------:|-------:
+| Train on 50k  | 89.31%        | 1069 / 10,000 | 200
+| Train on 60k  | 89.52%        | 1048 / 10,000 | 200
+
 ## References
 
-* [The Forward-Forward Algorithm: Some Preliminary Investigations, Geoffrey Hinton, NeurIPS 2022](https://www.cs.toronto.edu/~hinton/FFA13.pdf) <br/>
-* [Hinton's NIPS'22 Talk](https://nips.cc/virtual/2022/invited-talk/55869) <br/>
-* [Hinton's matlab code](https://www.cs.toronto.edu/~hinton/ffcode.zip) <br/>
+[1] [The Forward-Forward Algorithm: Some Preliminary Investigations, Geoffrey Hinton, NeurIPS 2022](https://www.cs.toronto.edu/~hinton/FFA13.pdf) <br/>
+[2] [Hinton's NIPS'22 Talk](https://nips.cc/virtual/2022/invited-talk/55869) <br/>
+[3] [Hinton's matlab code](https://www.cs.toronto.edu/~hinton/ffcode.zip) <br/>
 
