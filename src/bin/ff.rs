@@ -71,6 +71,13 @@ struct BatchWorkspace {
 
 impl BatchWorkspace {
     fn new(layers: &[usize], batch_size: usize) -> Self {
+        // Shape: [Batch Size x Layer Width] (for all layers 0..N)
+        let nst_template: Vec<Mat> = layers.iter().map(|&c| Mat::zeros(batch_size, c)).collect();
+        let st_template = nst_template[1..].to_vec(); // for hidden layers only
+        let dw_template: Vec<Mat> = (0..layers.len() - 1)
+            .map(|i| Mat::zeros(layers[i], layers[i + 1]))
+            .collect();
+
         BatchWorkspace {
             data: Mat::zeros(batch_size, layers[0]),
             targets: Mat::zeros(batch_size, NUMLAB),
@@ -78,36 +85,20 @@ impl BatchWorkspace {
             labin: Mat::zeros(batch_size, NUMLAB),
             dc_din_sup: Mat::zeros(batch_size, NUMLAB),
             neg_data: Mat::zeros(batch_size, layers[0]),
-            pos_st: layers[1..]
-                .iter()
-                .map(|&c| Mat::zeros(batch_size, c))
-                .collect(),
-            pos_nst: layers.iter().map(|&c| Mat::zeros(batch_size, c)).collect(),
-            neg_st: layers[1..]
-                .iter()
-                .map(|&c| Mat::zeros(batch_size, c))
-                .collect(),
-            neg_nst: layers.iter().map(|&c| Mat::zeros(batch_size, c)).collect(),
-            softmax_st: layers[1..]
-                .iter()
-                .map(|&c| Mat::zeros(batch_size, c))
-                .collect(),
-            softmax_nst: layers.iter().map(|&c| Mat::zeros(batch_size, c)).collect(),
+
+            pos_st: st_template.clone(),
+            neg_st: st_template.clone(),
+            pos_dc_din: st_template.clone(),
+            neg_dc_din: st_template.clone(),
+            softmax_st: st_template,
+
+            pos_nst: nst_template.clone(),
+            neg_nst: nst_template.clone(),
+            softmax_nst: nst_template.clone(),
+
             pos_probs: vec![vec![0.0; batch_size]; layers.len() - 1],
-            pos_dc_din: layers[1..]
-                .iter()
-                .map(|&c| Mat::zeros(batch_size, c))
-                .collect(),
-            neg_dc_din: layers[1..]
-                .iter()
-                .map(|&c| Mat::zeros(batch_size, c))
-                .collect(),
-            pos_dw: (0..layers.len() - 1)
-                .map(|i| Mat::zeros(layers[i], layers[i + 1]))
-                .collect(),
-            neg_dw: (0..layers.len() - 1)
-                .map(|i| Mat::zeros(layers[i], layers[i + 1]))
-                .collect(),
+            pos_dw: dw_template.clone(),
+            neg_dw: dw_template,
             sup_contrib: Mat::zeros(batch_size, NUMLAB),
             sw_grad_tmp: Mat::zeros(layers.iter().max().cloned().unwrap_or(NUMLAB), NUMLAB),
         }
