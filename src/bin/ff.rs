@@ -38,13 +38,22 @@ struct Args {
 // --- Data Structures ---
 
 struct Layer {
+    // --- Model Parameters ---
     weights: Mat,
     biases: Vec<f32>,
     supweights: Option<Mat>,
-    weights_grad: Mat,
+
+    // --- Optimizer State (Momentum/Velocity) ---
+    // These store the running average of gradients to smooth updates
+    weight_velocity: Mat,
     biases_grad: Vec<f32>,
-    supweights_grad: Option<Mat>,
-    mean_states: Vec<f32>,
+    sup_weight_velocity: Option<Mat>,
+
+    // --- Normalization State ---
+    // Stores the running average of neuron activity (activations)
+    // Used to punish neurons that are always on or always off
+    activity_running_mean: Vec<f32>,
+
 }
 
 struct BatchWorkspace {
@@ -100,7 +109,7 @@ impl BatchWorkspace {
             pos_dw: dw_template.clone(),
             neg_dw: dw_template,
             sup_contrib: Mat::zeros(batch_size, NUMLAB),
-            sw_grad_tmp: Mat::zeros(layers.iter().max().cloned().unwrap_or(NUMLAB), NUMLAB),
+            sw_grad_tmp: Mat::zeros(*layers.iter().max().unwrap(), NUMLAB),
         }
     }
 }
@@ -348,7 +357,7 @@ fn train_epoch(
         for l in MINLEVELSUP - 1..model.len() {
             if let Some(sw) = &mut model[l].supweights {
                 ws.softmax_nst[l + 1].t_matmul_into(&ws.dc_din_sup, &mut ws.sw_grad_tmp);
-                let g_buf = model[l].supweights_grad.as_mut().unwrap();
+                let g_buf = model[l].sup_weight_velocity.as_mut().unwrap();
                 let scale = epsgain * EPSILONSUP;
                 for i in 0..sw.data.len() {
                     g_buf.data[i] = DELAY * g_buf.data[i]
@@ -396,7 +405,7 @@ fn train_epoch(
         // --- 4. WEIGHT UPDATES ---
         for l in 0..model.len() {
             let cols = model[l].weights.cols;
-            let layer_mean: f32 = model[l].mean_states.iter().sum::<f32>() / cols as f32;
+            let layer_mean: f32 = model[l].activity_running_mean.iter().sum::<f32>() / cols as f32;
             let inv_bs = 1.0 / BATCH_SIZE as f32;
 
             for r in 0..BATCH_SIZE {
@@ -404,8 +413,8 @@ fn train_epoch(
                 let row_offset = r * cols;
                 for c in 0..cols {
                     let st = ws.pos_st[l].data[row_offset + c];
-                    model[l].mean_states[c] = 0.9 * model[l].mean_states[c] + 0.1 * (st * inv_bs);
-                    let reg = LAMBDAMEAN * (layer_mean - model[l].mean_states[c]);
+                    model[l].activity_running_mean[c] = 0.9 * model[l].activity_running_mean[c] + 0.1 * (st * inv_bs);
+                    let reg = LAMBDAMEAN * (layer_mean - model[l].activity_running_mean[c]);
                     ws.pos_dc_din[l].data[row_offset + c] = (1.0 - p) * st + reg;
                 }
             }
@@ -431,7 +440,7 @@ fn train_epoch(
             ws.neg_nst[l].t_matmul_into(&ws.neg_dc_din[l], &mut ws.neg_dw[l]);
 
             let w_scale = epsgain * EPSILON;
-            let wg = &mut model[l].weights_grad.data;
+            let wg = &mut model[l].weight_velocity.data;
             let w = &mut model[l].weights.data;
             let pdw = &ws.pos_dw[l].data;
             let ndw = &ws.neg_dw[l].data;
@@ -557,10 +566,10 @@ fn load_model(path: &str) -> std::io::Result<Vec<Layer>> {
         };
         let (rows, cols) = (weights.rows, weights.cols);
         model.push(Layer {
-            weights_grad: Mat::zeros(rows, cols),
+            weight_velocity: Mat::zeros(rows, cols),
             biases_grad: vec![0.0; cols],
-            supweights_grad: supweights.as_ref().map(|sw| Mat::zeros(sw.rows, sw.cols)),
-            mean_states: vec![0.5; cols],
+            sup_weight_velocity: supweights.as_ref().map(|sw| Mat::zeros(sw.rows, sw.cols)),
+            activity_running_mean: vec![0.5; cols],
             weights,
             biases,
             supweights,
@@ -583,10 +592,10 @@ fn train_model(dir: &str) -> Result<(), MnistError> {
                 weights: Mat::new_randn(fanin, fanout, 1.0 / (fanin as f32).sqrt(), &mut rng),
                 biases: vec![0.0; fanout],
                 supweights: Some(Mat::zeros(fanout, NUMLAB)),
-                weights_grad: Mat::zeros(fanin, fanout),
+                weight_velocity: Mat::zeros(fanin, fanout),
                 biases_grad: vec![0.0; fanout],
-                supweights_grad: Some(Mat::zeros(fanout, NUMLAB)),
-                mean_states: vec![0.5; fanout],
+                sup_weight_velocity: Some(Mat::zeros(fanout, NUMLAB)),
+                activity_running_mean: vec![0.5; fanout],
             }
         })
         .collect();
