@@ -178,9 +178,11 @@ fn layer_io_into(
     nst.norm_rows();
 }
 
+const MAX_SHIFT: i32 = 1;
+
 fn apply_random_shift(src_image: &[f32; NPIXELS], target_buffer: &mut [f32], rng: &mut SmallRng) {
-    let shift_x = rng.random_range(-1..=1);
-    let shift_y = rng.random_range(-1..=1);
+    let shift_x = rng.random_range(-MAX_SHIFT..=MAX_SHIFT);
+    let shift_y = rng.random_range(-MAX_SHIFT..=MAX_SHIFT);
 
     if shift_x == 0 && shift_y == 0 {
         target_buffer.copy_from_slice(src_image);
@@ -606,7 +608,7 @@ fn train_model(dir: &str) -> Result<(), MnistError> {
     let mut ws = BatchWorkspace::new(&LAYERS, BATCH_SIZE);
 
     // TRAINING RANGES
-    const RTRAIN: std::ops::Range<usize> = 0..60000;
+    const RTRAIN: std::ops::Range<usize> = 0..50000;
     const RVAL: std::ops::Range<usize> = 50000..60000;
 
     // Initialize indices specifically for the training slice size (50,000)
