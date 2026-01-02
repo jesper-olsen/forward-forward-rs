@@ -23,7 +23,7 @@ const SUPWC: f32 = 0.003;
 const EPSILON: f32 = 0.01;
 const EPSILONSUP: f32 = 0.1;
 const DELAY: f32 = 0.9;
-const LAYERS: [usize; 4] = [784, 1000, 1000, 1000];
+const LAYERS: [usize; 4] = [NPIXELS, 1000, 1000, 1000];
 const BATCH_SIZE: usize = 100;
 const MAX_EPOCH: usize = 200;
 
@@ -53,7 +53,6 @@ struct Layer {
     // Stores the running average of neuron activity (activations)
     // Used to punish neurons that are always on or always off
     activity_running_mean: Vec<f32>,
-
 }
 
 struct BatchWorkspace {
@@ -209,53 +208,6 @@ fn apply_random_shift(src_image: &[f32; NPIXELS], target_buffer: &mut [f32], rng
     }
 }
 
-/// Prepares the batch in parallel.
-/// Uses a seed vector to ensure deterministic behavior across threads.
-fn prepare_positive_batch(
-    images: &[[f32; NPIXELS]],
-    labels: &[u8],
-    indices: &[usize],
-    batch_idx: usize,
-    ws: &mut BatchWorkspace,
-    seeds: &[u64], // Pre-generated seeds for determinism
-) {
-    let batch_start = batch_idx * BATCH_SIZE;
-    let chunk_indices = &indices[batch_start..batch_start + BATCH_SIZE];
-
-    ws.data
-        .data
-        .par_chunks_exact_mut(NPIXELS)
-        .zip(ws.targets.data.par_chunks_exact_mut(NUMLAB))
-        .zip(chunk_indices)
-        .zip(seeds)
-        .for_each(|(((img_buf, target_buf), &sample_idx), &seed)| {
-            let mut local_rng = SmallRng::seed_from_u64(seed);
-
-            let img_buf: &mut [f32] = img_buf;
-            let target_buf: &mut [f32] = target_buf;
-            let label = labels[sample_idx] as usize;
-
-            // 1. Augment / Copy
-            if USE_AUGMENTATION {
-                apply_random_shift(&images[sample_idx], img_buf, &mut local_rng);
-            } else {
-                img_buf.copy_from_slice(&images[sample_idx][..]);
-            }
-
-            // 2. Set Targets (One Hot)
-            target_buf.fill(0.0);
-            target_buf[label] = 1.0;
-
-            // 3. Embed Label
-            img_buf[..NUMLAB].fill(0.0);
-            img_buf[label] = LABELSTRENGTH;
-        });
-
-    // Initialize first layer
-    ws.pos_nst[0].data.copy_from_slice(&ws.data.data);
-    ws.pos_nst[0].norm_rows();
-}
-
 fn train_epoch(
     model: &mut [Layer],
     images: &[[f32; NPIXELS]],
@@ -276,13 +228,49 @@ fn train_epoch(
     let mut total_cost = 0.0;
     indices.shuffle(rng);
 
-    for b in 0..num_batches {
+    for batch_idx in 0..num_batches {
+        // --- 0. PREPARE POSITIVE BATCH (POSITIVE) ---
+        // Prepares the batch in parallel.
         // Generate seeds for this batch on the main thread for determinism
         for seed in seed_buffer.iter_mut() {
             *seed = rng.next_u64();
         }
 
-        prepare_positive_batch(images, labels, indices, b, ws, seed_buffer);
+        let batch_start = batch_idx * BATCH_SIZE;
+        let chunk_indices = &indices[batch_start..batch_start + BATCH_SIZE];
+
+        ws.data
+            .data
+            .par_chunks_exact_mut(NPIXELS)
+            .zip(ws.targets.data.par_chunks_exact_mut(NUMLAB))
+            .zip(chunk_indices)
+            .zip(&*seed_buffer)
+            .for_each(|(((img_buf, target_buf), &sample_idx), seed)| {
+                let mut local_rng = SmallRng::seed_from_u64(*seed);
+
+                let img_buf: &mut [f32] = img_buf;
+                let target_buf: &mut [f32] = target_buf;
+                let label = labels[sample_idx] as usize;
+
+                // 1. Augment / Copy
+                if USE_AUGMENTATION {
+                    apply_random_shift(&images[sample_idx], img_buf, &mut local_rng);
+                } else {
+                    img_buf.copy_from_slice(&images[sample_idx][..]);
+                }
+
+                // 2. Set Targets (One Hot)
+                target_buf.fill(0.0);
+                target_buf[label] = 1.0;
+
+                // 3. Embed Label
+                img_buf[..NUMLAB].fill(0.0);
+                img_buf[label] = LABELSTRENGTH;
+            });
+
+        // Initialize first layer
+        ws.pos_nst[0].data.copy_from_slice(&ws.data.data);
+        ws.pos_nst[0].norm_rows();
 
         // --- 1. FORWARD PASS (POSITIVE) ---
         for l in 0..model.len() {
@@ -305,7 +293,7 @@ fn train_epoch(
         // --- 2. SOFTMAX ---
         ws.lab_data.data.copy_from_slice(&ws.data.data);
         for r in 0..BATCH_SIZE {
-            ws.lab_data.data[r * 784..r * 784 + NUMLAB].fill(LABELSTRENGTH / NUMLAB as f32);
+            ws.lab_data.data[r * NPIXELS..r * NPIXELS + NUMLAB].fill(LABELSTRENGTH / NUMLAB as f32);
         }
         ws.softmax_nst[0].data.copy_from_slice(&ws.lab_data.data);
         ws.softmax_nst[0].norm_rows();
@@ -393,7 +381,7 @@ fn train_epoch(
                     }
                 }
             }
-            let img_start = r * 784;
+            let img_start = r * NPIXELS;
             let label_slice = &mut ws.neg_data.data[img_start..img_start + NUMLAB];
             label_slice.fill(0.0);
             label_slice[sel] = LABELSTRENGTH;
@@ -413,7 +401,8 @@ fn train_epoch(
                 let row_offset = r * cols;
                 for c in 0..cols {
                     let st = ws.pos_st[l].data[row_offset + c];
-                    model[l].activity_running_mean[c] = 0.9 * model[l].activity_running_mean[c] + 0.1 * (st * inv_bs);
+                    model[l].activity_running_mean[c] =
+                        0.9 * model[l].activity_running_mean[c] + 0.1 * (st * inv_bs);
                     let reg = LAMBDAMEAN * (layer_mean - model[l].activity_running_mean[c]);
                     ws.pos_dc_din[l].data[row_offset + c] = (1.0 - p) * st + reg;
                 }
@@ -467,7 +456,7 @@ fn train_epoch(
 }
 
 fn predict(model: &[Layer], image: &[f32], ws: &mut BatchWorkspace) -> usize {
-    ws.data.data[..784].copy_from_slice(image);
+    ws.data.data[..NPIXELS].copy_from_slice(image);
     ws.data.data[..NUMLAB].fill(LABELSTRENGTH / NUMLAB as f32);
     let input_len = ws.pos_nst[0].data.len();
     ws.pos_nst[0]
@@ -578,8 +567,12 @@ fn load_model(path: &str) -> std::io::Result<Vec<Layer>> {
     Ok(model)
 }
 
-fn train_model(dir: &str) -> Result<(), MnistError> {
-    let data = Mnist::load(dir)?;
+fn train_model(
+    train_imgs: &[[f32; NPIXELS]],
+    val_imgs: &[[f32; NPIXELS]],
+    train_labels: &[u8],
+    val_labels: &[u8],
+) -> Result<(), MnistError> {
     // UNIFIED RNG: Single SmallRng used for everything.
     let mut rng = SmallRng::seed_from_u64(1234);
 
@@ -600,27 +593,17 @@ fn train_model(dir: &str) -> Result<(), MnistError> {
         })
         .collect();
 
-    let train_imgs: Vec<[f32; NPIXELS]> = data
-        .train_images
-        .iter()
-        .map(|img| img.as_f32_array())
-        .collect();
     let mut ws = BatchWorkspace::new(&LAYERS, BATCH_SIZE);
 
-    // TRAINING RANGES
-    const RTRAIN: std::ops::Range<usize> = 0..50000;
-    const RVAL: std::ops::Range<usize> = 50000..60000;
-
-    // Initialize indices specifically for the training slice size (50,000)
-    let mut indices: Vec<usize> = (0..RTRAIN.len()).collect();
+    // Initialize indices specifically for the training slice size
+    let mut indices: Vec<usize> = (0..train_imgs.len()).collect();
     let mut seed_buffer: Vec<u64> = vec![0; BATCH_SIZE];
 
-    println!("Training Forward-Forward Model on {dir}...");
     for epoch in 0..MAX_EPOCH {
         let cost = train_epoch(
             &mut model,
-            &train_imgs[RTRAIN],
-            &data.train_labels[RTRAIN],
+            train_imgs,
+            train_labels,
             epoch,
             &mut rng,
             &mut ws,
@@ -629,8 +612,8 @@ fn train_model(dir: &str) -> Result<(), MnistError> {
         );
 
         if (epoch > 0 && epoch % 5 == 0) || epoch == MAX_EPOCH - 1 {
-            let (errors0, total0) = fftest(&model, &train_imgs[RTRAIN], &data.train_labels[RTRAIN]);
-            let (errors1, total1) = fftest(&model, &train_imgs[RVAL], &data.train_labels[RVAL]);
+            let (errors0, total0) = fftest(&model, train_imgs, train_labels);
+            let (errors1, total1) = fftest(&model, val_imgs, val_labels);
             println!(
                 "Epoch {epoch:3} | Cost: {cost:8.4} | Err Train: ({errors0}/{total0}), Err Val: ({errors1}/{total1})"
             );
@@ -642,7 +625,7 @@ fn train_model(dir: &str) -> Result<(), MnistError> {
     Ok(())
 }
 
-fn calc_confusions(model: &[Layer], images: &[[f32; 784]], labels: &[u8]) -> [[usize; 10]; 10] {
+fn calc_confusions(model: &[Layer], images: &[[f32; NPIXELS]], labels: &[u8]) -> [[usize; 10]; 10] {
     let mut matrix = [[0usize; 10]; 10];
     let mut ws = BatchWorkspace::new(&LAYERS, 1);
     println!("Calculating confusion matrix...");
@@ -678,26 +661,31 @@ fn print_confusions(matrix: &[[usize; 10]; 10]) {
 fn main() -> Result<(), MnistError> {
     let args = Args::parse();
 
-    train_model(&args.dir)?;
-    if true {
-        let data = Mnist::load(&args.dir)?;
-        let train_imgs: Vec<[f32; NPIXELS]> = data
-            .train_images
-            .iter()
-            .map(|img| img.as_f32_array())
-            .collect();
-        let test_imgs: Vec<[f32; NPIXELS]> = data
-            .test_images
-            .iter()
-            .map(|img| img.as_f32_array())
-            .collect();
-        let model = load_model("model_ff.bin")?;
-        let (errors, total) = fftest(&model, &test_imgs, &data.test_labels);
-        println!("Test Errors: ({errors}/{total})");
-        let (errors, total) = fftest(&model, &train_imgs, &data.train_labels);
-        println!("Train Errors: ({errors}/{total})");
-        let matrix = calc_confusions(&model, &test_imgs, &data.test_labels);
-        print_confusions(&matrix);
-    }
+    println!("Training Forward-Forward Model on {} ...", args.dir);
+    let data = Mnist::load(&args.dir)?;
+    let train_imgs: Vec<[f32; NPIXELS]> = data
+        .train_images
+        .iter()
+        .map(|img| img.as_f32_array())
+        .collect();
+    let test_imgs: Vec<[f32; NPIXELS]> = data
+        .test_images
+        .iter()
+        .map(|img| img.as_f32_array())
+        .collect();
+    let train_val_split = 50000;
+    let (train_imgs, val_imgs) = train_imgs.split_at(train_val_split);
+    let (train_labels, val_labels) = data.train_labels.split_at(train_val_split);
+
+    train_model(train_imgs, val_imgs, train_labels, val_labels)?;
+    let model = load_model("model_ff.bin")?;
+    let (test_errors, test_total) = fftest(&model, &test_imgs, &data.test_labels);
+    let (train_errors, train_total) = fftest(&model, train_imgs, train_labels);
+    let (val_errors, val_total) = fftest(&model, val_imgs, val_labels);
+    println!(
+        "Errors - Test: {test_errors}/{test_total}, Val: {val_errors}/{val_total}, Train: {train_errors}/{train_total}"
+    );
+    let matrix = calc_confusions(&model, &test_imgs, &data.test_labels);
+    print_confusions(&matrix);
     Ok(())
 }
