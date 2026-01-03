@@ -22,7 +22,7 @@ const EPSILON: f32 = 0.01;
 const EPSILONSUP: f32 = 0.1;
 const DELAY: f32 = 0.9;
 const MAX_EPOCH: usize = 200;
-const LAYERS: [usize;4] = [784,1000,1000,1000];
+const LAYERS: [usize; 4] = [784, 1000, 1000, 1000];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,16 +31,15 @@ struct Config {
     /// X-axis range: min,max
     dir: String,
 
-    #[arg(long, default_value_t = 0.10)]
+    #[arg(long, default_value_t = 0.15)]
     pub dropout: f32,
 
     #[arg(long, default_value_t = 0.03)]
     pub lambda_mean: f32,
-    
+
     //// Using Vec allows flexible network depth, unlike [usize; 4]
     //#[arg(long, value_delimiter = ',', default_value = "784,1000,1000,1000")]
     //pub layers: Vec<usize>,
-
     #[arg(long, default_value_t = 100)]
     pub batch_size: usize,
 }
@@ -65,19 +64,105 @@ struct Layer {
     activity_running_mean: Vec<f32>,
 }
 
-//pub struct FFModel {
-//    layers: Vec<Layer>,
-//    config: Config,
-//}
+pub struct FFModel {
+    layers: Vec<Layer>,
+}
 
-//impl FFModel {
-//    pub fn new(config: &Config) -> Self { ... }
-//    
-//    pub fn train(&mut self, train_imgs: &[...], ...) -> Result<f32, ...> {
-//        // Move the training loop here
-//        // Use self.config.batch_size instead of const
-//    }
-//}
+impl FFModel {
+    // We only need Config here to create the initial random weights
+    pub fn new(rng: &mut SmallRng) -> Self {
+        let layers: Vec<Layer> = (0..LAYERS.len() - 1)
+            .map(|i| {
+                let fanin = LAYERS[i];
+                let fanout = LAYERS[i + 1];
+                Layer {
+                    weights: Mat::new_randn(fanin, fanout, 1.0 / (fanin as f32).sqrt(), rng),
+                    biases: vec![0.0; fanout],
+                    supweights: Some(Mat::zeros(fanout, NUMLAB)),
+                    weight_velocity: Mat::zeros(fanin, fanout),
+                    biases_grad: vec![0.0; fanout],
+                    sup_weight_velocity: Some(Mat::zeros(fanout, NUMLAB)),
+                    activity_running_mean: vec![0.5; fanout],
+                }
+            })
+            .collect();
+        FFModel { layers }
+    }
+
+    fn save(&self, path: &str) -> std::io::Result<()> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        // Just save the number of layers.
+        // The matrices themselves self-describe their dimensions.
+        writer.write_all(&(self.layers.len() as u64).to_le_bytes())?;
+
+        for layer in &self.layers {
+            layer.weights.write_raw(&mut writer)?;
+
+            writer.write_all(&(layer.biases.len() as u64).to_le_bytes())?;
+            // endianness risk...
+            let b_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    layer.biases.as_ptr() as *const u8,
+                    layer.biases.len() * 4,
+                )
+            };
+            writer.write_all(b_bytes)?;
+
+            if let Some(sw) = &layer.supweights {
+                writer.write_all(&[1u8])?;
+                sw.write_raw(&mut writer)?;
+            } else {
+                writer.write_all(&[0u8])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn load(path: &str) -> std::io::Result<FFModel> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf)?;
+        let num_layers = u64::from_le_bytes(buf) as usize;
+
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            // Mat::read_raw reads the rows/cols, so we recover topology automatically
+            let weights = Mat::read_raw(&mut reader)?;
+
+            reader.read_exact(&mut buf)?;
+            let b_len = u64::from_le_bytes(buf) as usize;
+            let mut biases = vec![0.0f32; b_len];
+            let b_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(biases.as_mut_ptr() as *mut u8, b_len * 4)
+            };
+            reader.read_exact(b_bytes)?;
+
+            let mut opt = [0u8; 1];
+            reader.read_exact(&mut opt)?;
+            let supweights = if opt[0] == 1 {
+                Some(Mat::read_raw(&mut reader)?)
+            } else {
+                None
+            };
+
+            // Reconstruct the training buffers based on the loaded weights
+            let (rows, cols) = (weights.rows, weights.cols);
+            layers.push(Layer {
+                weight_velocity: Mat::zeros(rows, cols),
+                biases_grad: vec![0.0; cols],
+                sup_weight_velocity: supweights.as_ref().map(|sw| Mat::zeros(sw.rows, sw.cols)),
+                activity_running_mean: vec![0.5; cols],
+                weights,
+                biases,
+                supweights,
+            });
+        }
+        Ok(FFModel { layers })
+    }
+}
 
 struct BatchWorkspace {
     data: Mat,
@@ -151,6 +236,20 @@ fn goodness(row: &[f32], temp: f32) -> f32 {
     sigmoid((sum_sq - cols) / temp)
 }
 
+fn update_batch_goodness(st_mat: &Mat, temp: f32, probs_out: &mut [f32]) {
+    let cols = st_mat.cols;
+    let d = cols as f32;
+
+    st_mat
+        .data
+        .par_chunks_exact(cols)
+        .zip(probs_out.par_iter_mut())
+        .for_each(|(row, p)| {
+            let sum_sq: f32 = row.iter().map(|&x| x * x).sum();
+            *p = sigmoid((sum_sq - d) / temp);
+        });
+}
+
 #[inline(always)]
 fn sanitise_slice(data: &mut [f32]) {
     if SANITISE {
@@ -179,7 +278,7 @@ fn layer_io_into(
     if let Some(rng) = orng
         && USE_DROPOUT
     {
-        let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout).sqrt(); // TODO: no sqrt?
+        let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout);
         st.data.chunks_exact_mut(cols).for_each(|row| {
             for (val, &bias) in row.iter_mut().zip(layer.biases.iter()) {
                 *val = (*val + bias).max(0.0); // ReLU
@@ -235,14 +334,14 @@ fn apply_random_shift(src_image: &[f32; NPIXELS], target_buffer: &mut [f32], rng
 
 fn train_epoch(
     cfg: &Config,
-    model: &mut [Layer],
+    model: &mut FFModel,
     images: &[[f32; NPIXELS]],
     labels: &[u8],
     epoch: usize,
     rng: &mut SmallRng,
     ws: &mut BatchWorkspace,
     indices: &mut [usize],
-    seed_buffer: &mut Vec<u64>,
+    seed_buffer: &mut [u64],
 ) -> f32 {
     let num_batches = images.len() / cfg.batch_size;
     let epsgain = if epoch < MAX_EPOCH / 2 {
@@ -299,22 +398,23 @@ fn train_epoch(
         ws.pos_nst[0].norm_rows();
 
         // --- 1. FORWARD PASS (POSITIVE) ---
-        for l in 0..model.len() {
+        for l in 0..model.layers.len() {
             let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
             layer_io_into(
                 cfg,
                 &prev_nst[l],
-                &model[l],
+                &model.layers[l],
                 &mut ws.pos_st[l],
                 &mut next_nst[0],
                 Some(rng),
             );
             sanitise_slice(&mut ws.pos_st[l].data);
 
-            let cols = ws.pos_st[l].cols;
-            for r in 0..cfg.batch_size {
-                ws.pos_probs[l][r] = goodness(&ws.pos_st[l].data[r * cols..(r + 1) * cols], TEMP);
-            }
+            //let cols = ws.pos_st[l].cols;
+            //for r in 0..cfg.batch_size {
+            //    ws.pos_probs[l][r] = goodness(&ws.pos_st[l].data[r * cols..(r + 1) * cols], TEMP);
+            //}
+            update_batch_goodness(&ws.pos_st[l], TEMP, &mut ws.pos_probs[l]);
         }
 
         // --- 2. SOFTMAX ---
@@ -325,12 +425,12 @@ fn train_epoch(
         ws.softmax_nst[0].data.copy_from_slice(&ws.lab_data.data);
         ws.softmax_nst[0].norm_rows();
 
-        for l in 0..model.len() {
+        for l in 0..model.layers.len() {
             let (prev_nst, next_nst) = ws.softmax_nst.split_at_mut(l + 1);
             layer_io_into(
                 cfg,
                 &prev_nst[l],
-                &model[l],
+                &model.layers[l],
                 &mut ws.softmax_st[l],
                 &mut next_nst[0],
                 Some(rng),
@@ -339,8 +439,8 @@ fn train_epoch(
 
         // Supervised Contributions
         ws.labin.data.fill(0.0);
-        for l in MINLEVELSUP - 1..model.len() {
-            if let Some(sw) = &model[l].supweights {
+        for l in MINLEVELSUP - 1..model.layers.len() {
+            if let Some(sw) = &model.layers[l].supweights {
                 ws.softmax_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
                 for i in 0..ws.labin.data.len() {
                     ws.labin.data[i] += ws.sup_contrib.data[i];
@@ -355,11 +455,13 @@ fn train_epoch(
             let target_row = &ws.targets.data[r * NUMLAB..(r + 1) * NUMLAB];
 
             let max_val = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let mut sum_exp = 0.0;
-            for x in row.iter_mut() {
-                *x = (*x - max_val).exp();
-                sum_exp += *x;
-            }
+            let sum_exp: f32 = row
+                .iter_mut()
+                .map(|x| {
+                    *x = (*x - max_val).exp();
+                    *x
+                })
+                .sum();
 
             let mut correct_p = 0.0;
             for c in 0..NUMLAB {
@@ -370,10 +472,10 @@ fn train_epoch(
             total_cost += -(correct_p + TINY).ln();
         }
 
-        for l in MINLEVELSUP - 1..model.len() {
-            if let Some(sw) = &mut model[l].supweights {
+        for (l, layer) in model.layers.iter_mut().enumerate().skip(MINLEVELSUP - 1) {
+            if let Some(sw) = &mut layer.supweights {
                 ws.softmax_nst[l + 1].t_matmul_into(&ws.dc_din_sup, &mut ws.sw_grad_tmp);
-                let g_buf = model[l].sup_weight_velocity.as_mut().unwrap();
+                let g_buf = layer.sup_weight_velocity.as_mut().unwrap();
                 let scale = epsgain * EPSILONSUP;
                 for i in 0..sw.data.len() {
                     g_buf.data[i] = DELAY * g_buf.data[i]
@@ -390,25 +492,29 @@ fn train_epoch(
             let probs = &ws.labin.data[start_idx..start_idx + NUMLAB];
             let targets = &ws.targets.data[start_idx..start_idx + NUMLAB];
 
-            let mut sel = 0;
-            let rv: f32 = rng.random();
-            let mut cum = 0.0;
-            let sum_other: f32 = probs
+            // Use "Fitness Proportionate Selection" to select a difficult non-target
+            let sum_non_target: f32 = probs
                 .iter()
                 .zip(targets)
                 .filter(|&(_, &t)| t == 0.0)
                 .map(|(&p, _)| p)
                 .sum();
 
-            for (c, (&p, &t)) in probs.iter().zip(targets).enumerate() {
-                if t == 0.0 {
-                    cum += p / (sum_other + TINY);
-                    if rv < cum {
-                        sel = c;
-                        break;
+            let find_neg = |rv: f32, sum_non_target: f32| -> usize {
+                let mut cum = 0.0;
+                for (c, (&p, &t)) in probs.iter().zip(targets).enumerate() {
+                    if t == 0.0 {
+                        cum += p / (sum_non_target + TINY);
+                        if rv < cum {
+                            return c;
+                        }
                     }
                 }
-            }
+                // fell through - happens if target is close to 1 (sum_non_target close to 0)
+                targets.iter().position(|&t| t == 0.0).unwrap_or(0)
+            };
+            let sel = find_neg(rng.random(), sum_non_target);
+
             let img_start = r * NPIXELS;
             let label_slice = &mut ws.neg_data.data[img_start..img_start + NUMLAB];
             label_slice.fill(0.0);
@@ -419,9 +525,9 @@ fn train_epoch(
         ws.neg_nst[0].norm_rows();
 
         // --- 4. WEIGHT UPDATES ---
-        for l in 0..model.len() {
-            let cols = model[l].weights.cols;
-            let layer_mean: f32 = model[l].activity_running_mean.iter().sum::<f32>() / cols as f32;
+        for (l, layer) in model.layers.iter_mut().enumerate() {
+            let cols = layer.weights.cols;
+            let layer_mean: f32 = layer.activity_running_mean.iter().sum::<f32>() / cols as f32;
             let inv_bs = 1.0 / cfg.batch_size as f32;
 
             for r in 0..cfg.batch_size {
@@ -429,9 +535,9 @@ fn train_epoch(
                 let row_offset = r * cols;
                 for c in 0..cols {
                     let st = ws.pos_st[l].data[row_offset + c];
-                    model[l].activity_running_mean[c] =
-                        0.9 * model[l].activity_running_mean[c] + 0.1 * (st * inv_bs);
-                    let reg = cfg.lambda_mean * (layer_mean - model[l].activity_running_mean[c]);
+                    layer.activity_running_mean[c] =
+                        0.9 * layer.activity_running_mean[c] + 0.1 * (st * inv_bs);
+                    let reg = cfg.lambda_mean * (layer_mean - layer.activity_running_mean[c]);
                     ws.pos_dc_din[l].data[row_offset + c] = (1.0 - p) * st + reg;
                 }
             }
@@ -441,7 +547,7 @@ fn train_epoch(
             layer_io_into(
                 cfg,
                 &prev_nst[l],
-                &model[l],
+                layer,
                 &mut ws.neg_st[l],
                 &mut next_nst[0],
                 Some(rng),
@@ -458,33 +564,63 @@ fn train_epoch(
             ws.neg_nst[l].t_matmul_into(&ws.neg_dc_din[l], &mut ws.neg_dw[l]);
 
             let w_scale = epsgain * EPSILON;
-            let wg = &mut model[l].weight_velocity.data;
-            let w = &mut model[l].weights.data;
+            let wg = &mut layer.weight_velocity.data;
+            let w = &mut layer.weights.data;
             let pdw = &ws.pos_dw[l].data;
             let ndw = &ws.neg_dw[l].data;
 
-            for i in 0..w.len() {
-                let g = (pdw[i] + ndw[i]) * inv_bs;
-                wg[i] = DELAY * wg[i] + (1.0 - DELAY) * g;
-                w[i] += w_scale * (wg[i] - WC * w[i]);
-            }
+            // Weight Update (Vectorised & Parallel)
+            wg.par_iter_mut()
+                .zip(w.par_iter_mut())
+                .zip(pdw.par_iter())
+                .zip(ndw.par_iter())
+                .for_each(|(((wg_i, w_i), pdw_i), ndw_i)| {
+                    let g = (pdw_i + ndw_i) * inv_bs;
+                    *wg_i = DELAY * *wg_i + (1.0 - DELAY) * g;
+                    *w_i += w_scale * (*wg_i - WC * *w_i);
+                });
 
-            let bg = &mut model[l].biases_grad;
-            let b = &mut model[l].biases;
-            for c in 0..b.len() {
-                let mut g = 0.0;
-                for r in 0..cfg.batch_size {
-                    g += ws.pos_dc_din[l].data[r * cols + c] + ws.neg_dc_din[l].data[r * cols + c];
-                }
-                bg[c] = DELAY * bg[c] + (1.0 - DELAY) * (g * inv_bs);
-                b[c] += w_scale * bg[c];
-            }
+            // Weight Update
+            //for i in 0..w.len() {
+            //    let g = (pdw[i] + ndw[i]) * inv_bs;
+            //    wg[i] = DELAY * wg[i] + (1.0 - DELAY) * g;
+            //    w[i] += w_scale * (wg[i] - WC * w[i]);
+            //}
+
+            // Bias Update (Vectorised & Parallel)
+            layer
+                .biases_grad
+                .par_iter_mut()
+                .zip(layer.biases.par_iter_mut())
+                .enumerate()
+                .for_each(|(c, (bg_c, b_c))| {
+                    let g: f32 = (0..cfg.batch_size)
+                        .map(|r| {
+                            ws.pos_dc_din[l].data[r * cols + c]
+                                + ws.neg_dc_din[l].data[r * cols + c]
+                        })
+                        .sum();
+                    *bg_c = DELAY * (*bg_c) + (1.0 - DELAY) * g * inv_bs;
+                    *b_c += w_scale * (*bg_c);
+                });
+
+            // Bias Update
+            //let bg = &mut layer.biases_grad;
+            //let b = &mut layer.biases;
+            //for c in 0..b.len() {
+            //    let mut g = 0.0;
+            //    for r in 0..cfg.batch_size {
+            //        g += ws.pos_dc_din[l].data[r * cols + c] + ws.neg_dc_din[l].data[r * cols + c];
+            //    }
+            //    bg[c] = DELAY * bg[c] + (1.0 - DELAY) * (g * inv_bs);
+            //    b[c] += w_scale * bg[c];
+            //}
         }
     }
     total_cost / num_batches as f32
 }
 
-fn predict(cfg: &Config, model: &[Layer], image: &[f32], ws: &mut BatchWorkspace) -> usize {
+fn predict(cfg: &Config, model: &FFModel, image: &[f32], ws: &mut BatchWorkspace) -> usize {
     ws.data.data[..NPIXELS].copy_from_slice(image);
     ws.data.data[..NUMLAB].fill(LABELSTRENGTH / NUMLAB as f32);
     let input_len = ws.pos_nst[0].data.len();
@@ -493,12 +629,12 @@ fn predict(cfg: &Config, model: &[Layer], image: &[f32], ws: &mut BatchWorkspace
         .copy_from_slice(&ws.data.data[..input_len]);
     ws.pos_nst[0].norm_rows();
 
-    for l in 0..model.len() {
+    for l in 0..model.layers.len() {
         let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
         layer_io_into(
             cfg,
             &prev_nst[l],
-            &model[l],
+            &model.layers[l],
             &mut ws.pos_st[l],
             &mut next_nst[0],
             None,
@@ -506,8 +642,8 @@ fn predict(cfg: &Config, model: &[Layer], image: &[f32], ws: &mut BatchWorkspace
     }
 
     let mut scores = [0.0f32; NUMLAB];
-    for l in MINLEVELSUP - 1..model.len() {
-        if let Some(sw) = &model[l].supweights {
+    for l in MINLEVELSUP - 1..model.layers.len() {
+        if let Some(sw) = &model.layers[l].supweights {
             ws.pos_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
             for c in 0..NUMLAB {
                 scores[c] += ws.sup_contrib.data[c];
@@ -522,7 +658,12 @@ fn predict(cfg: &Config, model: &[Layer], image: &[f32], ws: &mut BatchWorkspace
         .unwrap()
 }
 
-fn fftest(cfg: &Config, model: &[Layer], images: &[[f32; NPIXELS]], labels: &[u8]) -> (usize, usize) {
+fn fftest(
+    cfg: &Config,
+    model: &FFModel,
+    images: &[[f32; NPIXELS]],
+    labels: &[u8],
+) -> (usize, usize) {
     let errors: usize = images
         .par_iter()
         .zip(labels)
@@ -540,63 +681,6 @@ fn fftest(cfg: &Config, model: &[Layer], images: &[[f32; NPIXELS]], labels: &[u8
     (errors, images.len())
 }
 
-fn save_model(model: &[Layer], path: &str) -> std::io::Result<()> {
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&(model.len() as u64).to_le_bytes())?;
-    for layer in model {
-        layer.weights.write_raw(&mut writer)?;
-        writer.write_all(&(layer.biases.len() as u64).to_le_bytes())?;
-        let b_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(layer.biases.as_ptr() as *const u8, layer.biases.len() * 4)
-        };
-        writer.write_all(b_bytes)?;
-        if let Some(sw) = &layer.supweights {
-            writer.write_all(&[1u8])?;
-            sw.write_raw(&mut writer)?;
-        } else {
-            writer.write_all(&[0u8])?;
-        }
-    }
-    Ok(())
-}
-
-fn load_model(path: &str) -> std::io::Result<Vec<Layer>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut b8 = [0u8; 8];
-    reader.read_exact(&mut b8)?;
-    let num_layers = u64::from_le_bytes(b8) as usize;
-    let mut model = Vec::with_capacity(num_layers);
-    for _ in 0..num_layers {
-        let weights = Mat::read_raw(&mut reader)?;
-        reader.read_exact(&mut b8)?;
-        let b_len = u64::from_le_bytes(b8) as usize;
-        let mut biases = vec![0.0f32; b_len];
-        let b_bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(biases.as_mut_ptr() as *mut u8, b_len * 4) };
-        reader.read_exact(b_bytes)?;
-        let mut opt_flag = [0u8; 1];
-        reader.read_exact(&mut opt_flag)?;
-        let supweights = if opt_flag[0] == 1 {
-            Some(Mat::read_raw(&mut reader)?)
-        } else {
-            None
-        };
-        let (rows, cols) = (weights.rows, weights.cols);
-        model.push(Layer {
-            weight_velocity: Mat::zeros(rows, cols),
-            biases_grad: vec![0.0; cols],
-            sup_weight_velocity: supweights.as_ref().map(|sw| Mat::zeros(sw.rows, sw.cols)),
-            activity_running_mean: vec![0.5; cols],
-            weights,
-            biases,
-            supweights,
-        });
-    }
-    Ok(model)
-}
-
 fn train_model(
     cfg: &Config,
     train_imgs: &[[f32; NPIXELS]],
@@ -607,22 +691,7 @@ fn train_model(
     // UNIFIED RNG: Single SmallRng used for everything.
     let mut rng = SmallRng::seed_from_u64(1234);
 
-    let mut model: Vec<Layer> = (0..LAYERS.len() - 1)
-        .map(|i| {
-            let fanin = LAYERS[i];
-            let fanout = LAYERS[i + 1];
-            // Requires updated Mat::new_randn that accepts generic Rng
-            Layer {
-                weights: Mat::new_randn(fanin, fanout, 1.0 / (fanin as f32).sqrt(), &mut rng),
-                biases: vec![0.0; fanout],
-                supweights: Some(Mat::zeros(fanout, NUMLAB)),
-                weight_velocity: Mat::zeros(fanin, fanout),
-                biases_grad: vec![0.0; fanout],
-                sup_weight_velocity: Some(Mat::zeros(fanout, NUMLAB)),
-                activity_running_mean: vec![0.5; fanout],
-            }
-        })
-        .collect();
+    let mut model = FFModel::new(&mut rng);
 
     let mut ws = BatchWorkspace::new(&LAYERS, cfg.batch_size);
 
@@ -653,11 +722,16 @@ fn train_model(
             println!("Epoch {epoch:3} | Cost: {cost:8.4}");
         }
     }
-    save_model(&model, "model_ff.bin")?;
+    model.save("model_ff.bin")?;
     Ok(())
 }
 
-fn calc_confusions(cfg: &Config, model: &[Layer], images: &[[f32; NPIXELS]], labels: &[u8]) -> [[usize; 10]; 10] {
+fn calc_confusions(
+    cfg: &Config,
+    model: &FFModel,
+    images: &[[f32; NPIXELS]],
+    labels: &[u8],
+) -> [[usize; 10]; 10] {
     let mut matrix = [[0usize; 10]; 10];
     let mut ws = BatchWorkspace::new(&LAYERS, 1);
     println!("Calculating confusion matrix...");
@@ -705,12 +779,12 @@ fn main() -> Result<(), MnistError> {
         .iter()
         .map(|img| img.as_f32_array())
         .collect();
-    let train_val_split = 60000;
+    let train_val_split = 50000;
     let (train_imgs, val_imgs) = train_imgs.split_at(train_val_split);
     let (train_labels, val_labels) = data.train_labels.split_at(train_val_split);
 
     train_model(&cfg, train_imgs, val_imgs, train_labels, val_labels)?;
-    let model = load_model("model_ff.bin")?;
+    let model = FFModel::load("model_ff.bin")?;
     let (test_errors, test_total) = fftest(&cfg, &model, &test_imgs, &data.test_labels);
     let (train_errors, train_total) = fftest(&cfg, &model, train_imgs, train_labels);
     let (val_errors, val_total) = fftest(&cfg, &model, val_imgs, val_labels);
