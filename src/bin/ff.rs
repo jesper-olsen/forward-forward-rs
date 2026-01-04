@@ -1,27 +1,19 @@
 use clap::Parser;
 use forward_forward::Mat;
-use mnist::{IMAGE_HEIGHT, IMAGE_WIDTH, Mnist, NPIXELS, error::MnistError};
+use mnist::{IMAGE_HEIGHT, IMAGE_WIDTH, Mnist, NPIXELS, NUM_LABELS, error::MnistError};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
-// --- Hyperparameters ---
+// --- Constants ---
 const USE_DROPOUT: bool = true;
 const USE_AUGMENTATION: bool = true;
+const AUG_MAX_SHIFT: i32 = 1; // AUGMENTATION - PIXELS to shift by
 const SANITISE: bool = false;
-const TINY: f32 = 1e-10;
-const NUMLAB: usize = 10;
-const TEMP: f32 = 1.0;
-const LABELSTRENGTH: f32 = 1.0;
+const TINY: f32 = 1e-10; // For numerical stability
 const MINLEVELSUP: usize = 2;
-const WC: f32 = 0.002;
-const SUPWC: f32 = 0.003;
-const EPSILON: f32 = 0.01;
-const EPSILONSUP: f32 = 0.1;
-const DELAY: f32 = 0.9;
-const MAX_EPOCH: usize = 200;
 const LAYERS: [usize; 4] = [784, 1000, 1000, 1000];
 
 #[derive(Parser, Debug)]
@@ -32,9 +24,11 @@ struct Config {
     dir: String,
 
     #[arg(long, default_value_t = 0.15)]
+    /// Probability of zeroing activations to prevent over-fitting
     pub dropout: f32,
 
     #[arg(long, default_value_t = 0.03)]
+    /// Strength of the penalty for neurons straying from the target mean activation
     pub lambda_mean: f32,
 
     //// Using Vec allows flexible network depth, unlike [usize; 4]
@@ -42,6 +36,38 @@ struct Config {
     //pub layers: Vec<usize>,
     #[arg(long, default_value_t = 100)]
     pub batch_size: usize,
+
+    /// Weight decay (L2 regularization) for main layers
+    #[arg(long, default_value_t = 0.002)]
+    pub weight_decay: f32,
+
+    /// Weight decay (L2 regularization) for supervised layers
+    #[arg(long, default_value_t = 0.003)]
+    pub sup_weight_decay: f32,
+
+    #[arg(long, default_value_t = 0.9)]
+    /// Momentum factor (exponential moving average of gradients)
+    pub momentum: f32,
+
+    /// Learning rate (step size) for weight updates
+    #[arg(short = 'e', long = "lr", default_value_t = 0.01)]
+    pub epsilon: f32,
+
+    /// Learning rate for the supervised output weights
+    #[arg(long = "lr-sup", default_value_t = 0.1)]
+    pub epsilon_sup: f32,
+
+    #[arg(long, default_value_t = 1.0)]
+    /// Magnitude of the label embedding in the input layer
+    pub label_strength: f32,
+
+    #[arg(long, default_value_t = 1.0)]
+    /// Temperature scaling for the goodness function (controls sigmoid sharpness)
+    pub temperature: f32,
+
+    #[arg(long, default_value_t = 200)]
+    /// Number of times to cycle through the training data.
+    pub max_epoch: usize,
 }
 
 // --- Data Structures ---
@@ -64,6 +90,49 @@ struct Layer {
     activity_running_mean: Vec<f32>,
 }
 
+impl Layer {
+    /// Applies MatMul -> Bias -> ReLU -> Dropout -> Normalization
+    fn forward(
+        &self,
+        cfg: &Config,
+        vin: &Mat,
+        raw_activations: &mut Mat,
+        normalised_activations: &mut Mat,
+        orng: Option<&mut SmallRng>,
+    ) {
+        vin.matmul_into(&self.weights, raw_activations);
+        let cols = raw_activations.cols;
+
+        // Process Bias + ReLU + Dropout
+        if let Some(rng) = orng
+            && USE_DROPOUT
+        {
+            let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout);
+            raw_activations.data.chunks_exact_mut(cols).for_each(|row| {
+                for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
+                    *val = (*val + bias).max(0.0); // ReLU
+                    *val = if rng.random::<f32>() < cfg.dropout {
+                        0.0
+                    } else {
+                        *val * dropout_scale
+                    };
+                }
+            });
+        } else {
+            // Inference path (Parallelizable)
+            raw_activations.data.par_chunks_mut(cols).for_each(|row| {
+                for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
+                    *val = (*val + bias).max(0.0);
+                }
+            });
+        }
+        normalised_activations
+            .data
+            .copy_from_slice(&raw_activations.data);
+        normalised_activations.norm_rows();
+    }
+}
+
 pub struct FFModel {
     layers: Vec<Layer>,
 }
@@ -78,10 +147,10 @@ impl FFModel {
                 Layer {
                     weights: Mat::new_randn(fanin, fanout, 1.0 / (fanin as f32).sqrt(), rng),
                     biases: vec![0.0; fanout],
-                    supweights: Some(Mat::zeros(fanout, NUMLAB)),
+                    supweights: Some(Mat::zeros(fanout, NUM_LABELS)),
                     weight_velocity: Mat::zeros(fanin, fanout),
                     biases_grad: vec![0.0; fanout],
-                    sup_weight_velocity: Some(Mat::zeros(fanout, NUMLAB)),
+                    sup_weight_velocity: Some(Mat::zeros(fanout, NUM_LABELS)),
                     activity_running_mean: vec![0.5; fanout],
                 }
             })
@@ -197,10 +266,10 @@ impl BatchWorkspace {
 
         BatchWorkspace {
             data: Mat::zeros(batch_size, layers[0]),
-            targets: Mat::zeros(batch_size, NUMLAB),
+            targets: Mat::zeros(batch_size, NUM_LABELS),
             lab_data: Mat::zeros(batch_size, layers[0]),
-            labin: Mat::zeros(batch_size, NUMLAB),
-            dc_din_sup: Mat::zeros(batch_size, NUMLAB),
+            labin: Mat::zeros(batch_size, NUM_LABELS),
+            dc_din_sup: Mat::zeros(batch_size, NUM_LABELS),
             neg_data: Mat::zeros(batch_size, layers[0]),
 
             pos_st: st_template.clone(),
@@ -216,8 +285,8 @@ impl BatchWorkspace {
             pos_probs: vec![vec![0.0; batch_size]; layers.len() - 1],
             pos_dw: dw_template.clone(),
             neg_dw: dw_template,
-            sup_contrib: Mat::zeros(batch_size, NUMLAB),
-            sw_grad_tmp: Mat::zeros(*layers.iter().max().unwrap(), NUMLAB),
+            sup_contrib: Mat::zeros(batch_size, NUM_LABELS),
+            sw_grad_tmp: Mat::zeros(*layers.iter().max().unwrap(), NUM_LABELS),
         }
     }
 }
@@ -262,50 +331,9 @@ fn sanitise_slice(data: &mut [f32]) {
     }
 }
 
-/// Applies MatMul -> Bias -> ReLU -> Dropout -> Normalization
-fn layer_io_into(
-    cfg: &Config,
-    vin: &Mat,
-    layer: &Layer,
-    st: &mut Mat,
-    nst: &mut Mat,
-    orng: Option<&mut SmallRng>,
-) {
-    vin.matmul_into(&layer.weights, st);
-    let cols = st.cols;
-
-    // Process Bias + ReLU + Dropout
-    if let Some(rng) = orng
-        && USE_DROPOUT
-    {
-        let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout);
-        st.data.chunks_exact_mut(cols).for_each(|row| {
-            for (val, &bias) in row.iter_mut().zip(layer.biases.iter()) {
-                *val = (*val + bias).max(0.0); // ReLU
-                *val = if rng.random::<f32>() < cfg.dropout {
-                    0.0
-                } else {
-                    *val * dropout_scale
-                };
-            }
-        });
-    } else {
-        // Inference path (Parallelizable)
-        st.data.par_chunks_mut(cols).for_each(|row| {
-            for (val, &bias) in row.iter_mut().zip(layer.biases.iter()) {
-                *val = (*val + bias).max(0.0);
-            }
-        });
-    }
-    nst.data.copy_from_slice(&st.data);
-    nst.norm_rows();
-}
-
-const MAX_SHIFT: i32 = 1;
-
 fn apply_random_shift(src_image: &[f32; NPIXELS], target_buffer: &mut [f32], rng: &mut SmallRng) {
-    let shift_x = rng.random_range(-MAX_SHIFT..=MAX_SHIFT);
-    let shift_y = rng.random_range(-MAX_SHIFT..=MAX_SHIFT);
+    let shift_x = rng.random_range(-AUG_MAX_SHIFT..=AUG_MAX_SHIFT);
+    let shift_y = rng.random_range(-AUG_MAX_SHIFT..=AUG_MAX_SHIFT);
 
     if shift_x == 0 && shift_y == 0 {
         target_buffer.copy_from_slice(src_image);
@@ -344,10 +372,10 @@ fn train_epoch(
     seed_buffer: &mut [u64],
 ) -> f32 {
     let num_batches = images.len() / cfg.batch_size;
-    let epsgain = if epoch < MAX_EPOCH / 2 {
+    let epsgain = if epoch < cfg.max_epoch / 2 {
         1.0
     } else {
-        (1.0 + 2.0 * (MAX_EPOCH - epoch) as f32) / MAX_EPOCH as f32
+        (1.0 + 2.0 * (cfg.max_epoch - epoch) as f32) / cfg.max_epoch as f32
     };
 
     let mut total_cost = 0.0;
@@ -367,7 +395,7 @@ fn train_epoch(
         ws.data
             .data
             .par_chunks_exact_mut(NPIXELS)
-            .zip(ws.targets.data.par_chunks_exact_mut(NUMLAB))
+            .zip(ws.targets.data.par_chunks_exact_mut(NUM_LABELS))
             .zip(chunk_indices)
             .zip(&*seed_buffer)
             .for_each(|(((img_buf, target_buf), &sample_idx), seed)| {
@@ -389,8 +417,8 @@ fn train_epoch(
                 target_buf[label] = 1.0;
 
                 // 3. Embed Label
-                img_buf[..NUMLAB].fill(0.0);
-                img_buf[label] = LABELSTRENGTH;
+                img_buf[..NUM_LABELS].fill(0.0);
+                img_buf[label] = cfg.label_strength;
             });
 
         // Initialize first layer
@@ -400,10 +428,9 @@ fn train_epoch(
         // --- 1. FORWARD PASS (POSITIVE) ---
         for l in 0..model.layers.len() {
             let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
-            layer_io_into(
+            model.layers[l].forward(
                 cfg,
                 &prev_nst[l],
-                &model.layers[l],
                 &mut ws.pos_st[l],
                 &mut next_nst[0],
                 Some(rng),
@@ -412,25 +439,25 @@ fn train_epoch(
 
             //let cols = ws.pos_st[l].cols;
             //for r in 0..cfg.batch_size {
-            //    ws.pos_probs[l][r] = goodness(&ws.pos_st[l].data[r * cols..(r + 1) * cols], TEMP);
+            //    ws.pos_probs[l][r] = goodness(&ws.pos_st[l].data[r * cols..(r + 1) * cols], cfg.temperature);
             //}
-            update_batch_goodness(&ws.pos_st[l], TEMP, &mut ws.pos_probs[l]);
+            update_batch_goodness(&ws.pos_st[l], cfg.temperature, &mut ws.pos_probs[l]);
         }
 
         // --- 2. SOFTMAX ---
         ws.lab_data.data.copy_from_slice(&ws.data.data);
         for r in 0..cfg.batch_size {
-            ws.lab_data.data[r * NPIXELS..r * NPIXELS + NUMLAB].fill(LABELSTRENGTH / NUMLAB as f32);
+            ws.lab_data.data[r * NPIXELS..r * NPIXELS + NUM_LABELS]
+                .fill(cfg.label_strength / NUM_LABELS as f32);
         }
         ws.softmax_nst[0].data.copy_from_slice(&ws.lab_data.data);
         ws.softmax_nst[0].norm_rows();
 
         for l in 0..model.layers.len() {
             let (prev_nst, next_nst) = ws.softmax_nst.split_at_mut(l + 1);
-            layer_io_into(
+            model.layers[l].forward(
                 cfg,
                 &prev_nst[l],
-                &model.layers[l],
                 &mut ws.softmax_st[l],
                 &mut next_nst[0],
                 Some(rng),
@@ -451,8 +478,8 @@ fn train_epoch(
 
         // Softmax & Gradients
         for r in 0..cfg.batch_size {
-            let row = &mut ws.labin.data[r * NUMLAB..(r + 1) * NUMLAB];
-            let target_row = &ws.targets.data[r * NUMLAB..(r + 1) * NUMLAB];
+            let row = &mut ws.labin.data[r * NUM_LABELS..(r + 1) * NUM_LABELS];
+            let target_row = &ws.targets.data[r * NUM_LABELS..(r + 1) * NUM_LABELS];
 
             let max_val = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             let sum_exp: f32 = row
@@ -464,10 +491,10 @@ fn train_epoch(
                 .sum();
 
             let mut correct_p = 0.0;
-            for c in 0..NUMLAB {
+            for c in 0..NUM_LABELS {
                 row[c] /= sum_exp;
                 correct_p += row[c] * target_row[c];
-                ws.dc_din_sup.data[r * NUMLAB + c] = target_row[c] - row[c];
+                ws.dc_din_sup.data[r * NUM_LABELS + c] = target_row[c] - row[c];
             }
             total_cost += -(correct_p + TINY).ln();
         }
@@ -476,11 +503,11 @@ fn train_epoch(
             if let Some(sw) = &mut layer.supweights {
                 ws.softmax_nst[l + 1].t_matmul_into(&ws.dc_din_sup, &mut ws.sw_grad_tmp);
                 let g_buf = layer.sup_weight_velocity.as_mut().unwrap();
-                let scale = epsgain * EPSILONSUP;
+                let scale = epsgain * cfg.epsilon_sup;
                 for i in 0..sw.data.len() {
-                    g_buf.data[i] = DELAY * g_buf.data[i]
-                        + (1.0 - DELAY) * ws.sw_grad_tmp.data[i] / cfg.batch_size as f32;
-                    sw.data[i] += scale * (g_buf.data[i] - SUPWC * sw.data[i]);
+                    g_buf.data[i] = cfg.momentum * g_buf.data[i]
+                        + (1.0 - cfg.momentum) * ws.sw_grad_tmp.data[i] / cfg.batch_size as f32;
+                    sw.data[i] += scale * (g_buf.data[i] - cfg.sup_weight_decay * sw.data[i]);
                 }
             }
         }
@@ -488,9 +515,9 @@ fn train_epoch(
         // --- 3. NEGATIVE PASS ---
         ws.neg_data.data.copy_from_slice(&ws.data.data);
         for r in 0..cfg.batch_size {
-            let start_idx = r * NUMLAB;
-            let probs = &ws.labin.data[start_idx..start_idx + NUMLAB];
-            let targets = &ws.targets.data[start_idx..start_idx + NUMLAB];
+            let start_idx = r * NUM_LABELS;
+            let probs = &ws.labin.data[start_idx..start_idx + NUM_LABELS];
+            let targets = &ws.targets.data[start_idx..start_idx + NUM_LABELS];
 
             // Use "Fitness Proportionate Selection" to select a difficult non-target
             let sum_non_target: f32 = probs
@@ -516,9 +543,9 @@ fn train_epoch(
             let sel = find_neg(rng.random(), sum_non_target);
 
             let img_start = r * NPIXELS;
-            let label_slice = &mut ws.neg_data.data[img_start..img_start + NUMLAB];
+            let label_slice = &mut ws.neg_data.data[img_start..img_start + NUM_LABELS];
             label_slice.fill(0.0);
-            label_slice[sel] = LABELSTRENGTH;
+            label_slice[sel] = cfg.label_strength;
         }
 
         ws.neg_nst[0].data.copy_from_slice(&ws.neg_data.data);
@@ -544,10 +571,9 @@ fn train_epoch(
             ws.pos_nst[l].t_matmul_into(&ws.pos_dc_din[l], &mut ws.pos_dw[l]);
 
             let (prev_nst, next_nst) = ws.neg_nst.split_at_mut(l + 1);
-            layer_io_into(
+            layer.forward(
                 cfg,
                 &prev_nst[l],
-                layer,
                 &mut ws.neg_st[l],
                 &mut next_nst[0],
                 Some(rng),
@@ -556,14 +582,14 @@ fn train_epoch(
             for r in 0..cfg.batch_size {
                 let row_offset = r * cols;
                 let row = &ws.neg_st[l].data[row_offset..row_offset + cols];
-                let p_neg = goodness(row, TEMP);
+                let p_neg = goodness(row, cfg.temperature);
                 for c in 0..cols {
                     ws.neg_dc_din[l].data[row_offset + c] = -p_neg * row[c];
                 }
             }
             ws.neg_nst[l].t_matmul_into(&ws.neg_dc_din[l], &mut ws.neg_dw[l]);
 
-            let w_scale = epsgain * EPSILON;
+            let w_scale = epsgain * cfg.epsilon;
             let wg = &mut layer.weight_velocity.data;
             let w = &mut layer.weights.data;
             let pdw = &ws.pos_dw[l].data;
@@ -576,15 +602,15 @@ fn train_epoch(
                 .zip(ndw.par_iter())
                 .for_each(|(((wg_i, w_i), pdw_i), ndw_i)| {
                     let g = (pdw_i + ndw_i) * inv_bs;
-                    *wg_i = DELAY * *wg_i + (1.0 - DELAY) * g;
-                    *w_i += w_scale * (*wg_i - WC * *w_i);
+                    *wg_i = cfg.momentum * *wg_i + (1.0 - cfg.momentum) * g;
+                    *w_i += w_scale * (*wg_i - cfg.weight_decay * *w_i);
                 });
 
             // Weight Update
             //for i in 0..w.len() {
             //    let g = (pdw[i] + ndw[i]) * inv_bs;
-            //    wg[i] = DELAY * wg[i] + (1.0 - DELAY) * g;
-            //    w[i] += w_scale * (wg[i] - WC * w[i]);
+            //    wg[i] = cfg.momentum * wg[i] + (1.0 - cfg.momentum) * g;
+            //    w[i] += w_scale * (wg[i] - cfg.weight_decay * w[i]);
             //}
 
             // Bias Update (Vectorised & Parallel)
@@ -600,7 +626,7 @@ fn train_epoch(
                                 + ws.neg_dc_din[l].data[r * cols + c]
                         })
                         .sum();
-                    *bg_c = DELAY * (*bg_c) + (1.0 - DELAY) * g * inv_bs;
+                    *bg_c = cfg.momentum * (*bg_c) + (1.0 - cfg.momentum) * g * inv_bs;
                     *b_c += w_scale * (*bg_c);
                 });
 
@@ -612,7 +638,7 @@ fn train_epoch(
             //    for r in 0..cfg.batch_size {
             //        g += ws.pos_dc_din[l].data[r * cols + c] + ws.neg_dc_din[l].data[r * cols + c];
             //    }
-            //    bg[c] = DELAY * bg[c] + (1.0 - DELAY) * (g * inv_bs);
+            //    bg[c] = cfg.momentum * bg[c] + (1.0 - cfg.momentum) * (g * inv_bs);
             //    b[c] += w_scale * bg[c];
             //}
         }
@@ -622,7 +648,7 @@ fn train_epoch(
 
 fn predict(cfg: &Config, model: &FFModel, image: &[f32], ws: &mut BatchWorkspace) -> usize {
     ws.data.data[..NPIXELS].copy_from_slice(image);
-    ws.data.data[..NUMLAB].fill(LABELSTRENGTH / NUMLAB as f32);
+    ws.data.data[..NUM_LABELS].fill(cfg.label_strength / NUM_LABELS as f32);
     let input_len = ws.pos_nst[0].data.len();
     ws.pos_nst[0]
         .data
@@ -631,21 +657,14 @@ fn predict(cfg: &Config, model: &FFModel, image: &[f32], ws: &mut BatchWorkspace
 
     for l in 0..model.layers.len() {
         let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
-        layer_io_into(
-            cfg,
-            &prev_nst[l],
-            &model.layers[l],
-            &mut ws.pos_st[l],
-            &mut next_nst[0],
-            None,
-        );
+        model.layers[l].forward(cfg, &prev_nst[l], &mut ws.pos_st[l], &mut next_nst[0], None);
     }
 
-    let mut scores = [0.0f32; NUMLAB];
+    let mut scores = [0.0f32; NUM_LABELS];
     for l in MINLEVELSUP - 1..model.layers.len() {
         if let Some(sw) = &model.layers[l].supweights {
             ws.pos_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
-            for c in 0..NUMLAB {
+            for c in 0..NUM_LABELS {
                 scores[c] += ws.sup_contrib.data[c];
             }
         }
@@ -699,7 +718,7 @@ fn train_model(
     let mut indices: Vec<usize> = (0..train_imgs.len()).collect();
     let mut seed_buffer: Vec<u64> = vec![0; cfg.batch_size];
 
-    for epoch in 0..MAX_EPOCH {
+    for epoch in 0..cfg.max_epoch {
         let cost = train_epoch(
             cfg,
             &mut model,
@@ -712,7 +731,7 @@ fn train_model(
             &mut seed_buffer,
         );
 
-        if (epoch > 0 && epoch % 5 == 0) || epoch == MAX_EPOCH - 1 {
+        if (epoch > 0 && epoch % 5 == 0) || epoch == cfg.max_epoch - 1 {
             let (errors0, total0) = fftest(cfg, &model, train_imgs, train_labels);
             let (errors1, total1) = fftest(cfg, &model, val_imgs, val_labels);
             println!(
@@ -767,7 +786,7 @@ fn print_confusions(matrix: &[[usize; 10]; 10]) {
 fn main() -> Result<(), MnistError> {
     let cfg = Config::parse();
 
-    println!("Training Forward-Forward Model on {} ...", cfg.dir);
+    println!("Training Forward-Forward Model \n{cfg:?}");
     let data = Mnist::load(&cfg.dir)?;
     let train_imgs: Vec<[f32; NPIXELS]> = data
         .train_images
