@@ -19,6 +19,10 @@ const LAYERS: [usize; 4] = [784, 1000, 1000, 1000];
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Config {
+    #[arg(long, default_value_t = 0)]
+    /// Number of threads to use (0 = auto)
+    pub threads: usize,
+
     #[arg(short, long="dir", default_value_t = String::from("MNIST"))]
     /// X-axis range: min,max
     dir: String,
@@ -169,14 +173,10 @@ impl FFModel {
             layer.weights.write_raw(&mut writer)?;
 
             writer.write_all(&(layer.biases.len() as u64).to_le_bytes())?;
-            // endianness risk...
-            let b_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    layer.biases.as_ptr() as *const u8,
-                    layer.biases.len() * 4,
-                )
-            };
-            writer.write_all(b_bytes)?;
+
+            for &bias in &layer.biases {
+                writer.write_all(&bias.to_le_bytes())?;
+            }
 
             if let Some(sw) = &layer.supweights {
                 writer.write_all(&[1u8])?;
@@ -192,22 +192,23 @@ impl FFModel {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        let mut buf = [0u8; 8];
-        reader.read_exact(&mut buf)?;
-        let num_layers = u64::from_le_bytes(buf) as usize;
+        let mut u64_buf = [0u8; 8];
+        let mut f32_buf = [0u8; 4];
+        reader.read_exact(&mut u64_buf)?;
+        let num_layers = u64::from_le_bytes(u64_buf) as usize;
 
         let mut layers = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             // Mat::read_raw reads the rows/cols, so we recover topology automatically
             let weights = Mat::read_raw(&mut reader)?;
 
-            reader.read_exact(&mut buf)?;
-            let b_len = u64::from_le_bytes(buf) as usize;
-            let mut biases = vec![0.0f32; b_len];
-            let b_bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(biases.as_mut_ptr() as *mut u8, b_len * 4)
-            };
-            reader.read_exact(b_bytes)?;
+            reader.read_exact(&mut u64_buf)?;
+            let b_len = u64::from_le_bytes(u64_buf) as usize;
+            let mut biases = Vec::with_capacity(b_len);
+            for _ in 0..b_len {
+                reader.read_exact(&mut f32_buf)?;
+                biases.push(f32::from_le_bytes(f32_buf));
+            }
 
             let mut opt = [0u8; 1];
             reader.read_exact(&mut opt)?;
@@ -372,11 +373,7 @@ fn train_epoch(
     seed_buffer: &mut [u64],
 ) -> f32 {
     let num_batches = images.len() / cfg.batch_size;
-    let epsgain = if epoch < cfg.max_epoch / 2 {
-        1.0
-    } else {
-        (1.0 + 2.0 * (cfg.max_epoch - epoch) as f32) / cfg.max_epoch as f32
-    };
+    let lr_scale = forward_forward::get_lr_scale(epoch, cfg.max_epoch);
 
     let mut total_cost = 0.0;
     indices.shuffle(rng);
@@ -503,7 +500,7 @@ fn train_epoch(
             if let Some(sw) = &mut layer.supweights {
                 ws.softmax_nst[l + 1].t_matmul_into(&ws.dc_din_sup, &mut ws.sw_grad_tmp);
                 let g_buf = layer.sup_weight_velocity.as_mut().unwrap();
-                let scale = epsgain * cfg.epsilon_sup;
+                let scale = lr_scale * cfg.epsilon_sup;
                 for i in 0..sw.data.len() {
                     g_buf.data[i] = cfg.momentum * g_buf.data[i]
                         + (1.0 - cfg.momentum) * ws.sw_grad_tmp.data[i] / cfg.batch_size as f32;
@@ -589,7 +586,7 @@ fn train_epoch(
             }
             ws.neg_nst[l].t_matmul_into(&ws.neg_dc_din[l], &mut ws.neg_dw[l]);
 
-            let w_scale = epsgain * cfg.epsilon;
+            let w_scale = lr_scale * cfg.epsilon;
             let wg = &mut layer.weight_velocity.data;
             let w = &mut layer.weights.data;
             let pdw = &ws.pos_dw[l].data;
@@ -786,7 +783,20 @@ fn print_confusions(matrix: &[[usize; 10]; 10]) {
 fn main() -> Result<(), MnistError> {
     let cfg = Config::parse();
 
-    println!("Training Forward-Forward Model \n{cfg:?}");
+    // Initialize Rayon if a specific count is requested
+    if cfg.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cfg.threads)
+            .build_global()
+            .map_err(|e| {
+                eprintln!("Warning: Could not set thread count: {e}");
+            })
+            .ok();
+        println!("Rayon initialized with {} threads", cfg.threads);
+    } else {
+        println!("Rayon using default thread count (logical cores)");
+    }
+
     let data = Mnist::load(&cfg.dir)?;
     let train_imgs: Vec<[f32; NPIXELS]> = data
         .train_images
@@ -802,6 +812,7 @@ fn main() -> Result<(), MnistError> {
     let (train_imgs, val_imgs) = train_imgs.split_at(train_val_split);
     let (train_labels, val_labels) = data.train_labels.split_at(train_val_split);
 
+    println!("Training Forward-Forward Model \n{cfg:?}");
     train_model(&cfg, train_imgs, val_imgs, train_labels, val_labels)?;
     let model = FFModel::load("model_ff.bin")?;
     let (test_errors, test_total) = fftest(&cfg, &model, &test_imgs, &data.test_labels);
