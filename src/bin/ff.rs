@@ -23,6 +23,10 @@ struct Config {
     /// Number of threads to use (0 = auto)
     pub threads: usize,
 
+    #[arg(long)]
+    /// Path to a saved model. If provided, training is skipped.
+    pub model: Option<String>,
+
     #[arg(short, long="dir", default_value_t = String::from("MNIST"))]
     /// X-axis range: min,max
     dir: String,
@@ -232,6 +236,93 @@ impl FFModel {
         }
         Ok(FFModel { layers })
     }
+
+    fn predict(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
+        ws.data.data[..NPIXELS].copy_from_slice(image);
+        ws.data.data[..NUM_LABELS].fill(cfg.label_strength / NUM_LABELS as f32);
+        let input_len = ws.pos_nst[0].data.len();
+        ws.pos_nst[0]
+            .data
+            .copy_from_slice(&ws.data.data[..input_len]);
+        ws.pos_nst[0].norm_rows();
+
+        for l in 0..self.layers.len() {
+            let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
+            self.layers[l].forward(cfg, &prev_nst[l], &mut ws.pos_st[l], &mut next_nst[0], None);
+        }
+
+        let mut scores = [0.0f32; NUM_LABELS];
+        for l in MINLEVELSUP - 1..self.layers.len() {
+            if let Some(sw) = &self.layers[l].supweights {
+                ws.pos_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
+                for c in 0..NUM_LABELS {
+                    scores[c] += ws.sup_contrib.data[c];
+                }
+            }
+        }
+        scores
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
+    fn run_forward(
+        &self,
+        cfg: &Config,
+        input: &Mat,
+        st_workspace: &mut [Mat],
+        nst_workspace: &mut [Mat],
+        mut rng: Option<&mut SmallRng>,
+    ) {
+        nst_workspace[0].data.copy_from_slice(&input.data);
+        nst_workspace[0].norm_rows();
+
+        for l in 0..self.layers.len() {
+            let (prev_nst, next_nst) = nst_workspace.split_at_mut(l + 1);
+            self.layers[l].forward(
+                cfg,
+                &prev_nst[l],
+                &mut st_workspace[l],
+                &mut next_nst[0],
+                // Re-wrapping the Option to satisfy the borrow checker
+                //rng.as_ref().map(|r| unsafe { &mut *( *r as *const SmallRng as *mut SmallRng ) }),
+                rng.as_mut().map(|r| r as &mut SmallRng),
+                //rng,
+            );
+            sanitise_slice(&mut st_workspace[l].data);
+        }
+    }
+
+    fn predict_energy(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
+        let mut label_energies = [0.0f32; NUM_LABELS];
+
+        for lab in 0..NUM_LABELS {
+            // 1. Prepare input for this specific label
+            ws.data.data[..NPIXELS].copy_from_slice(image);
+            set_one_hot(&mut ws.data.data[..NUM_LABELS], lab, cfg.label_strength);
+
+            // 2. Run Forward Pass
+            self.run_forward(cfg, &ws.data, &mut ws.pos_st, &mut ws.pos_nst, None);
+
+            // 3. Accumulate Energy (Sum of Squares) from MINLEVELSUP onwards
+            // In energy tests, we use the raw states (pos_st)
+            for l in (MINLEVELSUP - 1)..self.layers.len() {
+                let row = &ws.pos_st[l].data; // Batch size is 1 in fftest
+                let sum_sq: f32 = row.iter().map(|&x| x * x).sum();
+                label_energies[lab] += sum_sq;
+            }
+        }
+
+        // Return label with highest total energy
+        label_energies
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    }
 }
 
 struct BatchWorkspace {
@@ -293,6 +384,12 @@ impl BatchWorkspace {
 }
 
 // --- Helper Functions ---
+
+#[inline(always)]
+fn set_one_hot(slice: &mut [f32], index: usize, value: f32) {
+    slice[..NUM_LABELS].fill(0.0);
+    slice[index] = value;
+}
 
 #[inline(always)]
 fn sigmoid(x: f32) -> f32 {
@@ -398,8 +495,6 @@ fn train_epoch(
             .for_each(|(((img_buf, target_buf), &sample_idx), seed)| {
                 let mut local_rng = SmallRng::seed_from_u64(*seed);
 
-                let img_buf: &mut [f32] = img_buf;
-                let target_buf: &mut [f32] = target_buf;
                 let label = labels[sample_idx] as usize;
 
                 // 1. Augment / Copy
@@ -410,12 +505,10 @@ fn train_epoch(
                 }
 
                 // 2. Set Targets (One Hot)
-                target_buf.fill(0.0);
-                target_buf[label] = 1.0;
+                set_one_hot(target_buf, label, 1.0);
 
                 // 3. Embed Label
-                img_buf[..NUM_LABELS].fill(0.0);
-                img_buf[label] = cfg.label_strength;
+                set_one_hot(img_buf, label, cfg.label_strength);
             });
 
         // Initialize first layer
@@ -541,8 +634,7 @@ fn train_epoch(
 
             let img_start = r * NPIXELS;
             let label_slice = &mut ws.neg_data.data[img_start..img_start + NUM_LABELS];
-            label_slice.fill(0.0);
-            label_slice[sel] = cfg.label_strength;
+            set_one_hot(label_slice, sel, cfg.label_strength);
         }
 
         ws.neg_nst[0].data.copy_from_slice(&ws.neg_data.data);
@@ -643,35 +735,10 @@ fn train_epoch(
     total_cost / num_batches as f32
 }
 
-fn predict(cfg: &Config, model: &FFModel, image: &[f32], ws: &mut BatchWorkspace) -> usize {
-    ws.data.data[..NPIXELS].copy_from_slice(image);
-    ws.data.data[..NUM_LABELS].fill(cfg.label_strength / NUM_LABELS as f32);
-    let input_len = ws.pos_nst[0].data.len();
-    ws.pos_nst[0]
-        .data
-        .copy_from_slice(&ws.data.data[..input_len]);
-    ws.pos_nst[0].norm_rows();
-
-    for l in 0..model.layers.len() {
-        let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
-        model.layers[l].forward(cfg, &prev_nst[l], &mut ws.pos_st[l], &mut next_nst[0], None);
-    }
-
-    let mut scores = [0.0f32; NUM_LABELS];
-    for l in MINLEVELSUP - 1..model.layers.len() {
-        if let Some(sw) = &model.layers[l].supweights {
-            ws.pos_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
-            for c in 0..NUM_LABELS {
-                scores[c] += ws.sup_contrib.data[c];
-            }
-        }
-    }
-    scores
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i)
-        .unwrap()
+#[derive(Debug, Copy, Clone)]
+pub enum TestMode {
+    Softmax,
+    Energy,
 }
 
 fn fftest(
@@ -679,6 +746,7 @@ fn fftest(
     model: &FFModel,
     images: &[[f32; NPIXELS]],
     labels: &[u8],
+    mode: TestMode,
 ) -> (usize, usize) {
     let errors: usize = images
         .par_iter()
@@ -686,11 +754,11 @@ fn fftest(
         .map_init(
             || BatchWorkspace::new(&LAYERS, 1),
             |ws, (img, &label)| {
-                if predict(cfg, model, img, ws) != label as usize {
-                    1
-                } else {
-                    0
-                }
+                let guess = match mode {
+                    TestMode::Softmax => model.predict(cfg, img, ws),
+                    TestMode::Energy => model.predict_energy(cfg, img, ws),
+                };
+                if guess != label as usize { 1 } else { 0 }
             },
         )
         .sum();
@@ -729,8 +797,9 @@ fn train_model(
         );
 
         if (epoch > 0 && epoch % 5 == 0) || epoch == cfg.max_epoch - 1 {
-            let (errors0, total0) = fftest(cfg, &model, train_imgs, train_labels);
-            let (errors1, total1) = fftest(cfg, &model, val_imgs, val_labels);
+            let (errors0, total0) =
+                fftest(cfg, &model, train_imgs, train_labels, TestMode::Softmax);
+            let (errors1, total1) = fftest(cfg, &model, val_imgs, val_labels, TestMode::Softmax);
             println!(
                 "Epoch {epoch:3} | Cost: {cost:8.4} | Err Train: ({errors0}/{total0}), Err Val: ({errors1}/{total1})"
             );
@@ -752,7 +821,7 @@ fn calc_confusions(
     let mut ws = BatchWorkspace::new(&LAYERS, 1);
     println!("Calculating confusion matrix...");
     for (img, &label) in images.iter().zip(labels) {
-        let pred = predict(cfg, model, img, &mut ws);
+        let pred = model.predict(cfg, img, &mut ws);
         matrix[label as usize][pred] += 1;
     }
     matrix
@@ -812,15 +881,24 @@ fn main() -> Result<(), MnistError> {
     let (train_imgs, val_imgs) = train_imgs.split_at(train_val_split);
     let (train_labels, val_labels) = data.train_labels.split_at(train_val_split);
 
-    println!("Training Forward-Forward Model \n{cfg:?}");
-    train_model(&cfg, train_imgs, val_imgs, train_labels, val_labels)?;
-    let model = FFModel::load("model_ff.bin")?;
-    let (test_errors, test_total) = fftest(&cfg, &model, &test_imgs, &data.test_labels);
-    let (train_errors, train_total) = fftest(&cfg, &model, train_imgs, train_labels);
-    let (val_errors, val_total) = fftest(&cfg, &model, val_imgs, val_labels);
-    println!(
-        "Errors - Test: {test_errors}/{test_total}, Val: {val_errors}/{val_total}, Train: {train_errors}/{train_total}"
-    );
+    let model = if let Some(path) = &cfg.model {
+        println!("Loading model from {path}...");
+        FFModel::load(path)?
+    } else {
+        println!("Training Forward-Forward Model \n{cfg:?}");
+        train_model(&cfg, train_imgs, val_imgs, train_labels, val_labels)?;
+        FFModel::load("model_ff.bin").unwrap()
+    };
+
+    for mode in [TestMode::Softmax, TestMode::Energy] {
+        println!("TestMode: {mode:?}");
+        let (test_errors, test_total) = fftest(&cfg, &model, &test_imgs, &data.test_labels, mode);
+        let (train_errors, train_total) = fftest(&cfg, &model, train_imgs, train_labels, mode);
+        let (val_errors, val_total) = fftest(&cfg, &model, val_imgs, val_labels, mode);
+        println!(
+            "Errors - Test: {test_errors}/{test_total}, Val: {val_errors}/{val_total}, Train: {train_errors}/{train_total}"
+        );
+    }
     let matrix = calc_confusions(&cfg, &model, &test_imgs, &data.test_labels);
     print_confusions(&matrix);
     Ok(())
