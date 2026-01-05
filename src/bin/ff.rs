@@ -643,20 +643,37 @@ fn train_epoch(
         // --- 4. WEIGHT UPDATES ---
         for (l, layer) in model.layers.iter_mut().enumerate() {
             let cols = layer.weights.cols;
-            let layer_mean: f32 = layer.activity_running_mean.iter().sum::<f32>() / cols as f32;
             let inv_bs = 1.0 / cfg.batch_size as f32;
 
+            // Calculate the actual batch mean for each neuron 
+            let mut batch_means = vec![0.0; cols];
+            for r in 0..cfg.batch_size {
+                let row_offset = r * cols;
+                for c in 0..cols {
+                    batch_means[c] += ws.pos_st[l].data[row_offset + c] * inv_bs;
+                }
+            }
+
+            // Update the running mean once per batch
+            for c in 0..cols {
+                layer.activity_running_mean[c] = 
+                    0.9 * layer.activity_running_mean[c] + 0.1 * batch_means[c];
+            }
+
+            // calculate the global layer mean for the regularization term
+            let layer_mean: f32 = layer.activity_running_mean.iter().sum::<f32>() / cols as f32;
+
+            // gradient calculations
             for r in 0..cfg.batch_size {
                 let p = ws.pos_probs[l][r];
                 let row_offset = r * cols;
                 for c in 0..cols {
                     let st = ws.pos_st[l].data[row_offset + c];
-                    layer.activity_running_mean[c] =
-                        0.9 * layer.activity_running_mean[c] + 0.1 * (st * inv_bs);
                     let reg = cfg.lambda_mean * (layer_mean - layer.activity_running_mean[c]);
                     ws.pos_dc_din[l].data[row_offset + c] = (1.0 - p) * st + reg;
                 }
             }
+
             ws.pos_nst[l].t_matmul_into(&ws.pos_dc_din[l], &mut ws.pos_dw[l]);
 
             let (prev_nst, next_nst) = ws.neg_nst.split_at_mut(l + 1);
@@ -695,13 +712,6 @@ fn train_epoch(
                     *w_i += w_scale * (*wg_i - cfg.weight_decay * *w_i);
                 });
 
-            // Weight Update
-            //for i in 0..w.len() {
-            //    let g = (pdw[i] + ndw[i]) * inv_bs;
-            //    wg[i] = cfg.momentum * wg[i] + (1.0 - cfg.momentum) * g;
-            //    w[i] += w_scale * (wg[i] - cfg.weight_decay * w[i]);
-            //}
-
             // Bias Update (Vectorised & Parallel)
             layer
                 .biases_grad
@@ -718,18 +728,6 @@ fn train_epoch(
                     *bg_c = cfg.momentum * (*bg_c) + (1.0 - cfg.momentum) * g * inv_bs;
                     *b_c += w_scale * (*bg_c);
                 });
-
-            // Bias Update
-            //let bg = &mut layer.biases_grad;
-            //let b = &mut layer.biases;
-            //for c in 0..b.len() {
-            //    let mut g = 0.0;
-            //    for r in 0..cfg.batch_size {
-            //        g += ws.pos_dc_din[l].data[r * cols + c] + ws.neg_dc_din[l].data[r * cols + c];
-            //    }
-            //    bg[c] = cfg.momentum * bg[c] + (1.0 - cfg.momentum) * (g * inv_bs);
-            //    b[c] += w_scale * bg[c];
-            //}
         }
     }
     total_cost / num_batches as f32
