@@ -31,6 +31,10 @@ struct Config {
     /// X-axis range: min,max
     dir: String,
 
+    #[arg(long, default_value_t = 1234)]
+    /// Seed used to initialise the PRNG
+    pub seed: u64,
+
     #[arg(long, default_value_t = 0.15)]
     /// Probability of zeroing activations to prevent over-fitting
     pub dropout: f32,
@@ -100,46 +104,6 @@ struct Layer {
 
 impl Layer {
     /// Applies MatMul -> Bias -> ReLU -> Dropout -> Normalization
-    //fn forward(
-    //    &self,
-    //    cfg: &Config,
-    //    vin: &Mat,
-    //    raw_activations: &mut Mat,
-    //    normalised_activations: &mut Mat,
-    //    orng: Option<&mut SmallRng>,
-    //) {
-    //    vin.matmul_into(&self.weights, raw_activations);
-    //    let cols = raw_activations.cols;
-
-    //    // Process Bias + ReLU + Dropout
-    //    if let Some(rng) = orng
-    //        && USE_DROPOUT
-    //    {
-    //        let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout);
-    //        raw_activations.data.chunks_exact_mut(cols).for_each(|row| {
-    //            for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
-    //                *val = (*val + bias).max(0.0); // ReLU
-    //                *val = if rng.random::<f32>() < cfg.dropout {
-    //                    0.0
-    //                } else {
-    //                    *val * dropout_scale
-    //                };
-    //            }
-    //        });
-    //    } else {
-    //        // Inference path (Parallelizable)
-    //        raw_activations.data.par_chunks_mut(cols).for_each(|row| {
-    //            for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
-    //                *val = (*val + bias).max(0.0);
-    //            }
-    //        });
-    //    }
-    //    normalised_activations
-    //        .data
-    //        .copy_from_slice(&raw_activations.data);
-    //    normalised_activations.norm_rows();
-    //}
-    /// Applies MatMul -> Bias -> ReLU -> Normalization -> Dropout
     fn forward(
         &self,
         cfg: &Config,
@@ -216,8 +180,6 @@ impl FFModel {
     fn save(&self, path: &str) -> std::io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        // Just save the number of layers.
-        // The matrices themselves self-describe their dimensions.
         writer.write_all(&(self.layers.len() as u64).to_le_bytes())?;
 
         for layer in &self.layers {
@@ -817,7 +779,7 @@ fn train_model(
     val_labels: &[u8],
 ) -> Result<(), MnistError> {
     // UNIFIED RNG: Single SmallRng used for everything.
-    let mut rng = SmallRng::seed_from_u64(1234);
+    let mut rng = SmallRng::seed_from_u64(cfg.seed);
 
     let mut model = FFModel::new(&mut rng);
 
