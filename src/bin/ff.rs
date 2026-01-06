@@ -100,6 +100,46 @@ struct Layer {
 
 impl Layer {
     /// Applies MatMul -> Bias -> ReLU -> Dropout -> Normalization
+    //fn forward(
+    //    &self,
+    //    cfg: &Config,
+    //    vin: &Mat,
+    //    raw_activations: &mut Mat,
+    //    normalised_activations: &mut Mat,
+    //    orng: Option<&mut SmallRng>,
+    //) {
+    //    vin.matmul_into(&self.weights, raw_activations);
+    //    let cols = raw_activations.cols;
+
+    //    // Process Bias + ReLU + Dropout
+    //    if let Some(rng) = orng
+    //        && USE_DROPOUT
+    //    {
+    //        let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout);
+    //        raw_activations.data.chunks_exact_mut(cols).for_each(|row| {
+    //            for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
+    //                *val = (*val + bias).max(0.0); // ReLU
+    //                *val = if rng.random::<f32>() < cfg.dropout {
+    //                    0.0
+    //                } else {
+    //                    *val * dropout_scale
+    //                };
+    //            }
+    //        });
+    //    } else {
+    //        // Inference path (Parallelizable)
+    //        raw_activations.data.par_chunks_mut(cols).for_each(|row| {
+    //            for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
+    //                *val = (*val + bias).max(0.0);
+    //            }
+    //        });
+    //    }
+    //    normalised_activations
+    //        .data
+    //        .copy_from_slice(&raw_activations.data);
+    //    normalised_activations.norm_rows();
+    //}
+    /// Applies MatMul -> Bias -> ReLU -> Normalization -> Dropout
     fn forward(
         &self,
         cfg: &Config,
@@ -108,36 +148,43 @@ impl Layer {
         normalised_activations: &mut Mat,
         orng: Option<&mut SmallRng>,
     ) {
+        // 1. Standard Linear Projection
         vin.matmul_into(&self.weights, raw_activations);
         let cols = raw_activations.cols;
 
-        // Process Bias + ReLU + Dropout
-        if let Some(rng) = orng
-            && USE_DROPOUT
-        {
-            let dropout_scale: f32 = 1.0 / (1.0f32 - cfg.dropout);
-            raw_activations.data.chunks_exact_mut(cols).for_each(|row| {
-                for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
-                    *val = (*val + bias).max(0.0); // ReLU
-                    *val = if rng.random::<f32>() < cfg.dropout {
-                        0.0
-                    } else {
-                        *val * dropout_scale
-                    };
-                }
-            });
-        } else {
-            // Inference path (Parallelizable)
-            raw_activations.data.par_chunks_mut(cols).for_each(|row| {
-                for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
-                    *val = (*val + bias).max(0.0);
-                }
-            });
-        }
+        // 2. Element-wise Bias + ReLU (Parallelizable)
+        raw_activations.data.par_chunks_mut(cols).for_each(|row| {
+            for (val, &bias) in row.iter_mut().zip(self.biases.iter()) {
+                *val = (*val + bias).max(0.0); // ReLU
+            }
+        });
+
+        // 3. NORMALIZE FIRST
+        // We copy raw ReLU output to normalised_activations then normalize it.
+        // This ensures the NEXT layer gets unit-length vectors.
         normalised_activations
             .data
             .copy_from_slice(&raw_activations.data);
         normalised_activations.norm_rows();
+
+        // 4. APPLY DROPOUT TO BOTH (if training)
+        // We apply dropout to raw_activations so the "Goodness" (Energy)
+        // calculation is actually affected by the missing neurons.
+        if let Some(rng) = orng
+            && USE_DROPOUT
+        {
+            let dropout_scale: f32 = 1.0 / (1.0 - cfg.dropout);
+
+            for i in 0..raw_activations.data.len() {
+                if rng.random::<f32>() < cfg.dropout {
+                    raw_activations.data[i] = 0.0;
+                    normalised_activations.data[i] = 0.0;
+                } else {
+                    raw_activations.data[i] *= dropout_scale;
+                    normalised_activations.data[i] *= dropout_scale;
+                }
+            }
+        }
     }
 }
 
@@ -287,7 +334,6 @@ impl FFModel {
                 &mut st_workspace[l],
                 &mut next_nst[0],
                 // Re-wrapping the Option to satisfy the borrow checker
-                //rng.as_ref().map(|r| unsafe { &mut *( *r as *const SmallRng as *mut SmallRng ) }),
                 rng.as_mut().map(|r| r as &mut SmallRng),
                 //rng,
             );
@@ -645,7 +691,7 @@ fn train_epoch(
             let cols = layer.weights.cols;
             let inv_bs = 1.0 / cfg.batch_size as f32;
 
-            // Calculate the actual batch mean for each neuron 
+            // Calculate the actual batch mean for each neuron
             let mut batch_means = vec![0.0; cols];
             for r in 0..cfg.batch_size {
                 let row_offset = r * cols;
@@ -656,7 +702,7 @@ fn train_epoch(
 
             // Update the running mean once per batch
             for c in 0..cols {
-                layer.activity_running_mean[c] = 
+                layer.activity_running_mean[c] =
                     0.9 * layer.activity_running_mean[c] + 0.1 * batch_means[c];
             }
 
