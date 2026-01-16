@@ -41,6 +41,9 @@ struct Config {
 
     #[arg(long, default_value_t = 0.03)]
     /// Strength of the penalty for neurons straying from the target mean activation
+    // Peer normalization: we regress the mean activity of each neuron towards the average mean for its layer.
+    // This prevents dead or hysterical units. We pretend there is a gradient even when hidden units are off.
+    // Choose strength of regression (LAMBDAMEAN) so that average activities are similar but not too similar.
     pub lambda_mean: f32,
 
     //// Using Vec allows flexible network depth, unlike [usize; 4]
@@ -246,37 +249,6 @@ impl FFModel {
         Ok(FFModel { layers })
     }
 
-    fn predict(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
-        ws.data.data[..NPIXELS].copy_from_slice(image);
-        ws.data.data[..NUM_LABELS].fill(cfg.label_strength / NUM_LABELS as f32);
-        let input_len = ws.pos_nst[0].data.len();
-        ws.pos_nst[0]
-            .data
-            .copy_from_slice(&ws.data.data[..input_len]);
-        ws.pos_nst[0].norm_rows();
-
-        for l in 0..self.layers.len() {
-            let (prev_nst, next_nst) = ws.pos_nst.split_at_mut(l + 1);
-            self.layers[l].forward(cfg, &prev_nst[l], &mut ws.pos_st[l], &mut next_nst[0], None);
-        }
-
-        let mut scores = [0.0f32; NUM_LABELS];
-        for l in MINLEVELSUP - 1..self.layers.len() {
-            if let Some(sw) = &self.layers[l].supweights {
-                ws.pos_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
-                for c in 0..NUM_LABELS {
-                    scores[c] += ws.sup_contrib.data[c];
-                }
-            }
-        }
-        scores
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap()
-    }
-
     fn run_forward(
         &self,
         cfg: &Config,
@@ -303,18 +275,36 @@ impl FFModel {
         }
     }
 
+    fn predict(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
+        ws.data.data[..NPIXELS].copy_from_slice(image);
+        ws.data.data[..NUM_LABELS].fill(cfg.label_strength / NUM_LABELS as f32);
+
+        self.run_forward(cfg, &ws.data, &mut ws.pos_st, &mut ws.pos_nst, None);
+
+        let mut scores = [0.0f32; NUM_LABELS];
+        for l in MINLEVELSUP - 1..self.layers.len() {
+            if let Some(sw) = &self.layers[l].supweights {
+                ws.pos_nst[l + 1].matmul_into(sw, &mut ws.sup_contrib);
+                for c in 0..NUM_LABELS {
+                    scores[c] += ws.sup_contrib.data[c];
+                }
+            }
+        }
+
+        argmax(&scores)
+    }
+
     fn predict_energy(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
         let mut label_energies = [0.0f32; NUM_LABELS];
 
         for lab in 0..NUM_LABELS {
-            // 1. Prepare input for this specific label
+            // Prepare input for this specific label
             ws.data.data[..NPIXELS].copy_from_slice(image);
             set_one_hot(&mut ws.data.data[..NUM_LABELS], lab, cfg.label_strength);
 
-            // 2. Run Forward Pass
             self.run_forward(cfg, &ws.data, &mut ws.pos_st, &mut ws.pos_nst, None);
 
-            // 3. Accumulate Energy (Sum of Squares) from MINLEVELSUP onwards
+            // Accumulate Energy (Sum of Squares) from MINLEVELSUP onwards
             // In energy tests, we use the raw states (pos_st)
             for l in (MINLEVELSUP - 1)..self.layers.len() {
                 let row = &ws.pos_st[l].data; // Batch size is 1 in fftest
@@ -323,13 +313,7 @@ impl FFModel {
             }
         }
 
-        // Return label with highest total energy
-        label_energies
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap()
+        argmax(&label_energies)
     }
 }
 
@@ -392,6 +376,16 @@ impl BatchWorkspace {
 }
 
 // --- Helper Functions ---
+
+#[inline(always)]
+fn argmax(scores: &[f32]) -> usize {
+    scores
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap()
+}
 
 #[inline(always)]
 fn set_one_hot(slice: &mut [f32], index: usize, value: f32) {
@@ -679,6 +673,9 @@ fn train_epoch(
                     let st = ws.pos_st[l].data[row_offset + c];
                     let reg = cfg.lambda_mean * (layer_mean - layer.activity_running_mean[c]);
                     ws.pos_dc_din[l].data[row_offset + c] = (1.0 - p) * st + reg;
+                    // This is a regularizer that encourages the average activity of a unit to match that for
+                    // all the units in the layer. Notice that we do not gate by (states>0) for this extra term.
+                    // This allows the extra term to revive units that are always off.  May not be needed.
                 }
             }
 
@@ -780,9 +777,7 @@ fn train_model(
 ) -> Result<(), MnistError> {
     // UNIFIED RNG: Single SmallRng used for everything.
     let mut rng = SmallRng::seed_from_u64(cfg.seed);
-
     let mut model = FFModel::new(&mut rng);
-
     let mut ws = BatchWorkspace::new(&LAYERS, cfg.batch_size);
 
     // Initialize indices specifically for the training slice size
