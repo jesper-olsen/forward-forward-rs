@@ -619,20 +619,22 @@ fn train_epoch(
                 .map(|(&p, _)| p)
                 .sum();
 
-            let find_neg = |rv: f32, sum_non_target: f32| -> usize {
-                let mut cum = 0.0;
+            let find_neg = |rv: f32| -> usize {
+                let threshold = rv * sum_non_target;
+                let (mut cum, mut last) = (0.0, 0);
                 for (c, (&p, &t)) in probs.iter().zip(targets).enumerate() {
                     if t == 0.0 {
-                        cum += p / (sum_non_target + TINY);
-                        if rv < cum {
+                        cum += p;
+                        last = c;
+                        if threshold < cum {
                             return c;
                         }
                     }
                 }
-                // fell through - happens if target is close to 1 (sum_non_target close to 0)
-                targets.iter().position(|&t| t == 0.0).unwrap_or(0)
+                last
             };
-            let sel = find_neg(rng.random(), sum_non_target);
+
+            let sel = find_neg(rng.random());
 
             let img_start = r * NPIXELS;
             let label_slice = &mut ws.neg_data.data[img_start..img_start + NUM_LABELS];

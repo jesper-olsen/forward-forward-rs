@@ -10,7 +10,8 @@ pub fn get_lr_scale(epoch: usize, max_epoch: usize) -> f32 {
     if epoch < max_epoch / 2 {
         1.0
     } else {
-        (1.0 + 2.0 * (max_epoch - epoch) as f32) / max_epoch as f32
+        let lr = (1.0 + 2.0 * (max_epoch - epoch) as f32) / max_epoch as f32;
+        lr.min(1.0)
     }
 }
 
