@@ -10,7 +10,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 // --- Constants ---
 const USE_DROPOUT: bool = true;
 const USE_AUGMENTATION: bool = true;
-const AUG_MAX_SHIFT: i32 = 1; // AUGMENTATION - PIXELS to shift by
+const AUG_MAX_SHIFT: i32 = 2; // AUGMENTATION - PIXELS to shift by
 const SANITISE: bool = false;
 const TINY: f32 = 1e-10; // For numerical stability
 const MINLEVELSUP: usize = 2;
@@ -83,6 +83,11 @@ struct Config {
     #[arg(long, default_value_t = 200)]
     /// Number of times to cycle through the training data.
     pub max_epoch: usize,
+
+    #[arg(long)]
+    /// Also report test-time augmentation (TTA) errors: scores are summed over all
+    /// (2*AUG_MAX_SHIFT+1)^2 shifted copies of each image
+    pub tta: bool,
 }
 
 // --- Data Structures ---
@@ -276,6 +281,15 @@ impl FFModel {
     }
 
     fn predict(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
+        argmax(&self.scores(cfg, image, ws))
+    }
+
+    fn scores(
+        &self,
+        cfg: &Config,
+        image: &[f32],
+        ws: &mut BatchWorkspace,
+    ) -> [f32; NUM_LABELS] {
         ws.data.data[..NPIXELS].copy_from_slice(image);
         ws.data.data[..NUM_LABELS].fill(cfg.label_strength / NUM_LABELS as f32);
 
@@ -291,10 +305,19 @@ impl FFModel {
             }
         }
 
-        argmax(&scores)
+        scores
     }
 
     fn predict_energy(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
+        argmax(&self.energies(cfg, image, ws))
+    }
+
+    fn energies(
+        &self,
+        cfg: &Config,
+        image: &[f32],
+        ws: &mut BatchWorkspace,
+    ) -> [f32; NUM_LABELS] {
         let mut label_energies = [0.0f32; NUM_LABELS];
 
         for lab in 0..NUM_LABELS {
@@ -313,7 +336,7 @@ impl FFModel {
             }
         }
 
-        argmax(&label_energies)
+        label_energies
     }
 }
 
@@ -434,7 +457,10 @@ fn sanitise_slice(data: &mut [f32]) {
 fn apply_random_shift(src_image: &[f32; NPIXELS], target_buffer: &mut [f32], rng: &mut SmallRng) {
     let shift_x = rng.random_range(-AUG_MAX_SHIFT..=AUG_MAX_SHIFT);
     let shift_y = rng.random_range(-AUG_MAX_SHIFT..=AUG_MAX_SHIFT);
+    shift_image(src_image, target_buffer, shift_x, shift_y);
+}
 
+fn shift_image(src_image: &[f32], target_buffer: &mut [f32], shift_x: i32, shift_y: i32) {
     if shift_x == 0 && shift_y == 0 {
         target_buffer.copy_from_slice(src_image);
         return;
@@ -740,10 +766,33 @@ fn train_epoch(
     total_cost / num_batches as f32
 }
 
+/// Test-time augmentation: sum per-label scores over every shift in
+/// -AUG_MAX_SHIFT..=AUG_MAX_SHIFT (both axes) of the image.
+fn tta_sum(
+    image: &[f32],
+    ws: &mut BatchWorkspace,
+    score_fn: impl Fn(&[f32], &mut BatchWorkspace) -> [f32; NUM_LABELS],
+) -> [f32; NUM_LABELS] {
+    let mut buf = [0.0f32; NPIXELS];
+    let mut total = [0.0f32; NUM_LABELS];
+    for shift_y in -AUG_MAX_SHIFT..=AUG_MAX_SHIFT {
+        for shift_x in -AUG_MAX_SHIFT..=AUG_MAX_SHIFT {
+            shift_image(image, &mut buf, shift_x, shift_y);
+            let scores = score_fn(&buf, ws);
+            for (t, s) in total.iter_mut().zip(scores) {
+                *t += s;
+            }
+        }
+    }
+    total
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum TestMode {
     Softmax,
     Energy,
+    SoftmaxTta,
+    EnergyTta,
 }
 
 fn fftest(
@@ -762,6 +811,12 @@ fn fftest(
                 let guess = match mode {
                     TestMode::Softmax => model.predict(cfg, img, ws),
                     TestMode::Energy => model.predict_energy(cfg, img, ws),
+                    TestMode::SoftmaxTta => argmax(&tta_sum(img, ws, |im, w| {
+                        model.scores(cfg, im, w)
+                    })),
+                    TestMode::EnergyTta => argmax(&tta_sum(img, ws, |im, w| {
+                        model.energies(cfg, im, w)
+                    })),
                 };
                 if guess != label as usize { 1 } else { 0 }
             },
@@ -893,7 +948,11 @@ fn main() -> Result<(), MnistError> {
         FFModel::load("model_ff.bin").unwrap()
     };
 
-    for mode in [TestMode::Softmax, TestMode::Energy] {
+    let mut modes = vec![TestMode::Softmax, TestMode::Energy];
+    if cfg.tta {
+        modes.extend([TestMode::SoftmaxTta, TestMode::EnergyTta]);
+    }
+    for mode in modes {
         println!("TestMode: {mode:?}");
         let (test_errors, test_total) = fftest(&cfg, &model, &test_imgs, &data.test_labels, mode);
         let (train_errors, train_total) = fftest(&cfg, &model, train_imgs, train_labels, mode);
