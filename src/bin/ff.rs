@@ -10,7 +10,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 // --- Constants ---
 const USE_DROPOUT: bool = true;
 const USE_AUGMENTATION: bool = true;
-const AUG_MAX_SHIFT: i32 = 2; // AUGMENTATION - PIXELS to shift by
+const AUG_MAX_SHIFT: i32 = 1; // AUGMENTATION - PIXELS to shift by
 const SANITISE: bool = false;
 const TINY: f32 = 1e-10; // For numerical stability
 const MINLEVELSUP: usize = 2;
@@ -23,12 +23,13 @@ struct Config {
     /// Number of threads to use (0 = auto)
     pub threads: usize,
 
-    #[arg(long)]
-    /// Path to a saved model. If provided, training is skipped.
-    pub model: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    /// Path(s) to saved model(s), comma-separated or repeated. If provided, training is
+    /// skipped; with several models the scores are summed (ensemble).
+    pub model: Vec<String>,
 
     #[arg(short, long="dir", default_value_t = String::from("MNIST"))]
-    /// X-axis range: min,max
+    /// path to MNIST
     dir: String,
 
     #[arg(long, default_value_t = 1234)]
@@ -83,6 +84,10 @@ struct Config {
     #[arg(long, default_value_t = 200)]
     /// Number of times to cycle through the training data.
     pub max_epoch: usize,
+
+    #[arg(long, default_value_t = String::from("model_ff.bin"))]
+    /// Where to save the trained model
+    pub out: String,
 
     #[arg(long)]
     /// Also report test-time augmentation (TTA) errors: scores are summed over all
@@ -280,10 +285,6 @@ impl FFModel {
         }
     }
 
-    fn predict(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
-        argmax(&self.scores(cfg, image, ws))
-    }
-
     fn scores(
         &self,
         cfg: &Config,
@@ -306,10 +307,6 @@ impl FFModel {
         }
 
         scores
-    }
-
-    fn predict_energy(&self, cfg: &Config, image: &[f32], ws: &mut BatchWorkspace) -> usize {
-        argmax(&self.energies(cfg, image, ws))
     }
 
     fn energies(
@@ -787,17 +784,30 @@ fn tta_sum(
     total
 }
 
+/// Sum of per-label scores over all models (a single model gives its own scores).
+fn ensemble_sum(
+    models: &[FFModel],
+    mut score_fn: impl FnMut(&FFModel) -> [f32; NUM_LABELS],
+) -> [f32; NUM_LABELS] {
+    let mut total = [0.0f32; NUM_LABELS];
+    for m in models {
+        for (t, s) in total.iter_mut().zip(score_fn(m)) {
+            *t += s;
+        }
+    }
+    total
+}
+
 #[derive(Debug, Copy, Clone)]
 pub enum TestMode {
     Softmax,
     Energy,
     SoftmaxTta,
-    EnergyTta,
 }
 
 fn fftest(
     cfg: &Config,
-    model: &FFModel,
+    models: &[FFModel],
     images: &[[f32; NPIXELS]],
     labels: &[u8],
     mode: TestMode,
@@ -809,13 +819,14 @@ fn fftest(
             || BatchWorkspace::new(&LAYERS, 1),
             |ws, (img, &label)| {
                 let guess = match mode {
-                    TestMode::Softmax => model.predict(cfg, img, ws),
-                    TestMode::Energy => model.predict_energy(cfg, img, ws),
+                    TestMode::Softmax => {
+                        argmax(&ensemble_sum(models, |m| m.scores(cfg, img, ws)))
+                    }
+                    TestMode::Energy => {
+                        argmax(&ensemble_sum(models, |m| m.energies(cfg, img, ws)))
+                    }
                     TestMode::SoftmaxTta => argmax(&tta_sum(img, ws, |im, w| {
-                        model.scores(cfg, im, w)
-                    })),
-                    TestMode::EnergyTta => argmax(&tta_sum(img, ws, |im, w| {
-                        model.energies(cfg, im, w)
+                        ensemble_sum(models, |m| m.scores(cfg, im, w))
                     })),
                 };
                 if guess != label as usize { 1 } else { 0 }
@@ -856,8 +867,8 @@ fn train_model(
 
         if (epoch > 0 && epoch % 5 == 0) || epoch == cfg.max_epoch - 1 {
             let (errors0, total0) =
-                fftest(cfg, &model, train_imgs, train_labels, TestMode::Softmax);
-            let (errors1, total1) = fftest(cfg, &model, val_imgs, val_labels, TestMode::Softmax);
+                fftest(cfg, std::slice::from_ref(&model), train_imgs, train_labels, TestMode::Softmax);
+            let (errors1, total1) = fftest(cfg, std::slice::from_ref(&model), val_imgs, val_labels, TestMode::Softmax);
             println!(
                 "Epoch {epoch:3} | Cost: {cost:8.4} | Err Train: ({errors0}/{total0}), Err Val: ({errors1}/{total1})"
             );
@@ -865,13 +876,13 @@ fn train_model(
             println!("Epoch {epoch:3} | Cost: {cost:8.4}");
         }
     }
-    model.save("model_ff.bin")?;
+    model.save(&cfg.out)?;
     Ok(())
 }
 
 fn calc_confusions(
     cfg: &Config,
-    model: &FFModel,
+    models: &[FFModel],
     images: &[[f32; NPIXELS]],
     labels: &[u8],
 ) -> [[usize; 10]; 10] {
@@ -879,7 +890,7 @@ fn calc_confusions(
     let mut ws = BatchWorkspace::new(&LAYERS, 1);
     println!("Calculating confusion matrix...");
     for (img, &label) in images.iter().zip(labels) {
-        let pred = model.predict(cfg, img, &mut ws);
+        let pred = argmax(&ensemble_sum(models, |m| m.scores(cfg, img, &mut ws)));
         matrix[label as usize][pred] += 1;
     }
     matrix
@@ -939,29 +950,33 @@ fn main() -> Result<(), MnistError> {
     let (train_imgs, val_imgs) = train_imgs.split_at(train_val_split);
     let (train_labels, val_labels) = data.train_labels.split_at(train_val_split);
 
-    let model = if let Some(path) = &cfg.model {
-        println!("Loading model from {path}...");
-        FFModel::load(path)?
+    let models: Vec<FFModel> = if !cfg.model.is_empty() {
+        let mut models = Vec::new();
+        for path in &cfg.model {
+            println!("Loading model from {path}...");
+            models.push(FFModel::load(path)?);
+        }
+        models
     } else {
         println!("Training Forward-Forward Model \n{cfg:?}");
         train_model(&cfg, train_imgs, val_imgs, train_labels, val_labels)?;
-        FFModel::load("model_ff.bin").unwrap()
+        vec![FFModel::load(&cfg.out).unwrap()]
     };
 
     let mut modes = vec![TestMode::Softmax, TestMode::Energy];
     if cfg.tta {
-        modes.extend([TestMode::SoftmaxTta, TestMode::EnergyTta]);
+        modes.push(TestMode::SoftmaxTta);
     }
     for mode in modes {
         println!("TestMode: {mode:?}");
-        let (test_errors, test_total) = fftest(&cfg, &model, &test_imgs, &data.test_labels, mode);
-        let (train_errors, train_total) = fftest(&cfg, &model, train_imgs, train_labels, mode);
-        let (val_errors, val_total) = fftest(&cfg, &model, val_imgs, val_labels, mode);
+        let (test_errors, test_total) = fftest(&cfg, &models, &test_imgs, &data.test_labels, mode);
+        let (train_errors, train_total) = fftest(&cfg, &models, train_imgs, train_labels, mode);
+        let (val_errors, val_total) = fftest(&cfg, &models, val_imgs, val_labels, mode);
         println!(
             "Errors - Test: {test_errors}/{test_total}, Val: {val_errors}/{val_total}, Train: {train_errors}/{train_total}"
         );
     }
-    let matrix = calc_confusions(&cfg, &model, &test_imgs, &data.test_labels);
+    let matrix = calc_confusions(&cfg, &models, &test_imgs, &data.test_labels);
     print_confusions(&matrix);
     Ok(())
 }

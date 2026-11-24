@@ -2,8 +2,8 @@
 
 Rust implementation of Geoffrey Hinton's Forward-Forward algorithm [1]. The model is evaluated on MNIST and Fashion MNIST.
 
-On MNIST it achieves an error rate of 68/10,000 = 0.68% compared to the papers 1.40% baseline - achieved mainly by adding
-dropout and data augmentation to the training mix.
+On MNIST it achieves an error rate of 65/10,000 = 0.65% compared to the papers 1.40% baseline - achieved mainly by adding
+dropout, data augmentation and ensemble modelling to the training mix.
 
 On Fashion-MNIST it achieves 89.5% accuracy, which is competitive with standard backpropagation for non-convolutional networks.
 
@@ -26,7 +26,9 @@ Run the program:
 cargo run --bin ff --release -- --dir MNIST
 ```
 
-Sample output:
+<details>
+<summary>Sample output</summary>
+
 ```text
 Rayon using default thread count (logical cores)
 Training Forward-Forward Model
@@ -254,8 +256,10 @@ Actual |  P0    P1    P2    P3    P4    P5    P6    P7    P8    P9
 --------------------------------------------------------------------
 ```
 
+</details>
+
 ## Overview
-This model achieves state-of-the-art performance (99.31%) for fully connected Forward-Forward networks, halving the error rate of the original paper's baseline implementation [1].
+This model achieves state-of-the-art performance (99.32%) for fully connected Forward-Forward networks, halving the error rate of the original paper's baseline implementation [1].
 
 ### Key Techniques
 
@@ -265,7 +269,7 @@ This model achieves state-of-the-art performance (99.31%) for fully connected Fo
 
 * **Symmetric Augmentation**: Training samples are augmented by randomly shifting images up/down and left/right by one pixel. 
 
-* **Regularization**: 10% Dropout and Weight Decay (0.002) to prevent the model from memorising specific training pixels.
+* **Regularization**: 15% Dropout and Weight Decay (0.002) to prevent the model from memorising specific training pixels.
 
 * **Supervised Head**: A softmax layer sits on top of the normalised hidden states, accumulating scores from all supervised layers to provide the final classification.
 
@@ -275,6 +279,26 @@ This model achieves state-of-the-art performance (99.31%) for fully connected Fo
 |--------------:|--------------:|------------:|-------:
 | Train on 50k  | 99.32%        | 68 / 10,000 | 200
 | Train on 60k  | 99.34%        | 66 / 10,000 | 200
+
+#### Ensemble and test-time augmentation
+
+Test errors / 10,000 with the softmax readout, trained on 50k. Single models are mean ± sd over 5 seeds;
+the ensemble sums the logits of the 5 models. TTA sums the scores over the 9 one-pixel shifts of each test image.
+
+|                       | 200 epochs   | 500 epochs
+|----------------------:|-------------:|-----------:
+| Single model          | 74.6 ± 2.5   | 71.0 ± 5.9
+| Single model + TTA    | 70.8 ± 3.7   | 66.8 ± 1.8
+| 5-model ensemble      | 68           | 65
+| 5-model ensemble + TTA| 66           | 65
+
+```bash
+cargo run --release --bin ff -- --seed 1 --out model_s1.bin     # repeat for seeds 2-5
+cargo run --release --bin ff -- --tta --model model_s1.bin,model_s2.bin,model_s3.bin,model_s4.bin,model_s5.bin
+```
+
+The gains are modest (about 10%): the seeds make largely the same mistakes (5→3, 3→9, 7→2, 4→9), and three models
+capture most of the ensemble gain. TTA helps less once the models are ensembled or trained for 500 epochs.
 
 ### Results - Fashion MNIST
 
